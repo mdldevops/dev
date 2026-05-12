@@ -1,0 +1,6 @@
+{
+  "name": "PISO STREAM Admin",
+  "description": "Production-ready admin dashboard for managing coin-operated kiosk timers with real-time monitoring and remote control.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
