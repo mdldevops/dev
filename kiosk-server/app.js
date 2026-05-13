@@ -1,13 +1,30 @@
 const express = require('express');
 const cors = require('cors');
 
+const {
+  apiRateLimiter,
+  authRateLimiter,
+  adminRateLimiter,
+  deviceStateRateLimiter,
+  buildCorsOptions,
+} = require('./src/config/security');
 const userController = require('./src/controllers/userController');
 require('./src/config/database');
 
 const app = express();
+const corsOptions = buildCorsOptions();
 
-app.use(cors());
+app.set('trust proxy', 1);
+app.use(cors(corsOptions));
+app.options(/.*/, cors(corsOptions));
 app.use(express.json());
+
+app.use('/auth/register', authRateLimiter);
+app.use('/auth/login', authRateLimiter);
+app.use('/admin/verify-pin', adminRateLimiter);
+app.use('/admin/update-pin', adminRateLimiter);
+app.use('/device-state', deviceStateRateLimiter);
+app.use(apiRateLimiter);
 
 app.get('/health', (_req, res) => {
   res.json({

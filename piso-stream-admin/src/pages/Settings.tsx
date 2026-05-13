@@ -1,6 +1,9 @@
 import React, { useEffect, useState } from 'react';
 import { useStore } from '../store/useStore';
 
+const API_BASE_URL =
+  import.meta.env.VITE_API_BASE_URL?.trim() || 'http://192.168.1.7:523';
+
 export default function Settings() {
   const { settings, updateSettings, broadcast } = useStore();
   const [localRatios, setLocalRatios] = useState(settings.ratios);
@@ -32,7 +35,7 @@ export default function Settings() {
   const fetchAudioSettings = async () => {
     try {
       setIsLoadingAudio(true);
-      const response = await fetch('http://192.168.1.8:3000/settings/audio-config');
+      const response = await fetch(`${API_BASE_URL}/settings/audio-config`);
       if (response.ok) {
         const data = await response.json();
         if (data.success && data.audio) {
@@ -78,7 +81,7 @@ export default function Settings() {
     setAudioSaveError(null);
 
     try {
-      const response = await fetch('http://192.168.1.8:3000/settings/audio-config', {
+      const response = await fetch(`${API_BASE_URL}/settings/audio-config`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

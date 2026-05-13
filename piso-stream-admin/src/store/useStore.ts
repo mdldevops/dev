@@ -39,7 +39,7 @@ interface AppState {
 }
 
 const API_BASE_URL =
-  import.meta.env.VITE_API_BASE_URL?.trim() || 'http://192.168.1.8:3000';
+  import.meta.env.VITE_API_BASE_URL?.trim() || 'http://192.168.1.7:523';
 
 const toDateKey = (value: string | undefined | null) => {
   return String(value || '').split(/[ T]/)[0] || '';
