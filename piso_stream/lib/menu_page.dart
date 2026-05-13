@@ -55,6 +55,7 @@ class _MenuPageState extends State<MenuPage> {
   String? _currentCustomerUsername;
   String? _currentCustomerRole;
   String? _deviceId;
+  int? _chargerRelayPin;
   bool _sentOneMinuteWarning = false;
   bool _sentTwentySecondWarning = false;
 
@@ -86,6 +87,10 @@ class _MenuPageState extends State<MenuPage> {
 
   Future<void> _initializeDeviceStateSync() async {
     _deviceId = await DeviceIdentityService.getOrCreateDeviceId();
+    final prefs = await SharedPreferences.getInstance();
+    _chargerRelayPin = int.tryParse(
+      prefs.getString(AppSettings.chargerRelayPinKey) ?? '26',
+    );
     await _syncDeviceState();
     _deviceStateTimer?.cancel();
     _deviceStateTimer = Timer.periodic(const Duration(seconds: 5), (_) {
@@ -117,6 +122,7 @@ class _MenuPageState extends State<MenuPage> {
       username: _currentCustomerUsername,
       role: _currentCustomerRole,
       batteryLevel: batteryLevel,
+      chargerRelayPin: _chargerRelayPin,
     );
   }
 
@@ -134,6 +140,7 @@ class _MenuPageState extends State<MenuPage> {
       username: _currentCustomerUsername,
       role: _currentCustomerRole,
       batteryLevel: null,
+      chargerRelayPin: _chargerRelayPin,
     );
   }
 

@@ -23,6 +23,8 @@ let chargingSettingsCache = {
   stopAtPercent: 80,
 };
 const chargingRelayStates = {};
+const chargingCommandPendingStates = {};
+const launcherRelayPins = {};
 const SIMULATION_ENABLED = String(
   process.env.ENABLE_COIN_SIMULATION || '',
 ).toLowerCase() === 'true';
@@ -457,6 +459,7 @@ function sendChargerCommand({
   enabled,
   reason,
   batteryLevel = null,
+  relayPin = null,
 }) {
   let socket = findChargerSocketForLauncher({
     launcherDeviceId,
@@ -479,6 +482,7 @@ function sendChargerCommand({
       enabled,
       reason,
       batteryLevel,
+      relayPin,
       connectedChargerCount: getUniqueReadyChargerSockets().length,
     });
     return false;
@@ -500,6 +504,10 @@ function sendChargerCommand({
     payload.battery_level = Math.max(0, Math.min(100, Number(batteryLevel) || 0));
   }
 
+  if (relayPin != null) {
+    payload.relay_pin = Number(relayPin) || 0;
+  }
+
   socket.send(JSON.stringify(payload));
   console.log('CHARGER COMMAND:', {
     launcherDeviceId,
@@ -507,8 +515,16 @@ function sendChargerCommand({
     enabled: Boolean(enabled),
     reason,
     batteryLevel,
+    relayPin,
     mode,
   });
+  if (launcherDeviceId) {
+    chargingCommandPendingStates[launcherDeviceId] = {
+      enabled: Boolean(enabled),
+      relayPin: relayPin == null ? null : Number(relayPin) || 0,
+      requestedAt: Date.now(),
+    };
+  }
   return true;
 }
 
@@ -543,9 +559,19 @@ function evaluateChargingForDevice(deviceId) {
     return;
   }
 
+  const pendingState = chargingCommandPendingStates[normalizedDeviceId];
+  if (
+    pendingState &&
+    pendingState.enabled === nextShouldCharge &&
+    Date.now() - Number(pendingState.requestedAt || 0) <= 15000
+  ) {
+    return;
+  }
+
   chargingRelayStates[normalizedDeviceId] = nextShouldCharge;
   const launcherDeviceName =
     launcherDeviceNames[normalizedDeviceId] || deriveDeviceName(normalizedDeviceId);
+  const relayPin = launcherRelayPins[normalizedDeviceId] ?? null;
 
   sendChargerCommand({
     launcherDeviceId: normalizedDeviceId,
@@ -553,6 +579,7 @@ function evaluateChargingForDevice(deviceId) {
     enabled: nextShouldCharge,
     reason: nextShouldCharge ? 'battery_below_threshold' : 'battery_reached_stop_threshold',
     batteryLevel,
+    relayPin,
   });
 }
 
@@ -899,6 +926,44 @@ function registerChargerClient(socket, payload = {}) {
   }
 }
 
+function processChargerAck(payload = {}) {
+  const launcherDeviceId = String(
+    payload.launcherDeviceId || payload.launcher_device_id || '',
+  ).trim();
+  if (!launcherDeviceId) {
+    return { acknowledged: false, reason: 'missing_launcher_device_id' };
+  }
+
+  const enabled = Boolean(payload.enabled);
+  const relayPinValue =
+    payload.relayPin == null && payload.relay_pin == null
+      ? null
+      : Number(payload.relayPin ?? payload.relay_pin) || 0;
+
+  delete chargingCommandPendingStates[launcherDeviceId];
+
+  sendToDevice(launcherDeviceId, {
+    event: 'charger_ack',
+    deviceId: launcherDeviceId,
+    enabled,
+    relayPin: relayPinValue,
+    chargerDeviceId: String(payload.deviceId || payload.device_id || '').trim(),
+  });
+
+  console.log('CHARGER ACK:', {
+    launcherDeviceId,
+    enabled,
+    relayPin: relayPinValue,
+  });
+
+  return {
+    acknowledged: true,
+    launcherDeviceId,
+    enabled,
+    relayPin: relayPinValue,
+  };
+}
+
 function disconnectEsp32Client(socket) {
   rawEsp32Sockets.delete(socket);
 
@@ -1179,6 +1244,7 @@ async function updateDeviceState({
   role,
   isSessionActive,
   batteryLevel,
+  chargerRelayPin,
 }) {
   const normalizedDeviceId = String(deviceId || '').trim();
   if (!normalizedDeviceId) {
@@ -1194,7 +1260,10 @@ async function updateDeviceState({
   const normalizedUsername = String(username || '').trim() || 'Guest';
   const normalizedBatteryLevel =
     batteryLevel == null ? null : Math.max(0, Math.min(100, Number(batteryLevel) || 0));
+  const normalizedChargerRelayPin =
+    chargerRelayPin == null ? null : Number(chargerRelayPin) || 0;
   const previousState = runtimeDeviceStates[normalizedDeviceId];
+  const previousRelayPin = launcherRelayPins[normalizedDeviceId] ?? null;
   const nextIsSessionActive = Boolean(isSessionActive);
   const sessionStartedAt = nextIsSessionActive
     ? previousState?.isSessionActive
@@ -1210,6 +1279,7 @@ async function updateDeviceState({
     isSessionActive: nextIsSessionActive,
     sessionStartedAt,
     batteryLevel: normalizedBatteryLevel,
+    chargerRelayPin: normalizedChargerRelayPin,
     totalSpent:
       activeSession?.deviceId === normalizedDeviceId
         ? Number(activeSession.total || 0)
@@ -1218,6 +1288,42 @@ async function updateDeviceState({
   };
 
   await upsertKnownDevice(normalizedDeviceId);
+  if (normalizedChargerRelayPin != null && normalizedChargerRelayPin > 0) {
+    launcherRelayPins[normalizedDeviceId] = normalizedChargerRelayPin;
+  }
+
+  const relayChanged =
+    normalizedChargerRelayPin != null &&
+    normalizedChargerRelayPin > 0 &&
+    previousRelayPin != null &&
+    previousRelayPin !== normalizedChargerRelayPin;
+
+  if (relayChanged && chargingRelayStates[normalizedDeviceId] === true) {
+    const launcherDeviceName =
+      launcherDeviceNames[normalizedDeviceId] || deriveDeviceName(normalizedDeviceId);
+
+    sendChargerCommand({
+      launcherDeviceId: normalizedDeviceId,
+      launcherDeviceName,
+      enabled: false,
+      reason: 'relay_reassigned_old_off',
+      batteryLevel: normalizedBatteryLevel,
+      relayPin: previousRelayPin,
+    });
+
+    sendChargerCommand({
+      launcherDeviceId: normalizedDeviceId,
+      launcherDeviceName,
+      enabled: true,
+      reason: 'relay_reassigned_new_on',
+      batteryLevel: normalizedBatteryLevel,
+      relayPin: normalizedChargerRelayPin,
+    });
+    return {
+      success: true,
+    };
+  }
+
   evaluateChargingForDevice(normalizedDeviceId);
 
   return {
@@ -1435,6 +1541,9 @@ async function listDevices() {
       batteryLevel: hasFreshHeartbeat
         ? runtimeState.batteryLevel ?? null
         : null,
+      chargerRelayPin: hasFreshHeartbeat
+        ? runtimeState.chargerRelayPin ?? launcherRelayPins[deviceId] ?? null
+        : launcherRelayPins[deviceId] ?? null,
       isCharging: Boolean(chargingRelayStates[deviceId]),
     };
   });
@@ -2003,6 +2112,7 @@ module.exports = {
   trackChargerSocket,
   registerChargerClient,
   disconnectChargerClient,
+  processChargerAck,
   registerAccount,
   loginAccount,
   listCustomerAccounts,

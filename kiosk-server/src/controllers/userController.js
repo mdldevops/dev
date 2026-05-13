@@ -215,6 +215,7 @@ async function updateDeviceState(req, res) {
       role: req.body.role,
       isSessionActive: req.body.isSessionActive,
       batteryLevel: req.body.batteryLevel,
+      chargerRelayPin: req.body.chargerRelayPin,
     });
     return res.json(result);
   } catch (error) {

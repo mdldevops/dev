@@ -9,7 +9,7 @@ class DeviceStatusResult {
 }
 
 class ApiService {
-  static const String baseUrl = "http://192.168.1.18:3000";
+  static const String baseUrl = "http://192.168.1.7:3000";
 
   static Future<Map<String, dynamic>?> startSession(
     String deviceId, {
@@ -76,6 +76,7 @@ class ApiService {
     String? username,
     String? role,
     int? batteryLevel,
+    int? chargerRelayPin,
   }) async {
     final url = Uri.parse("$baseUrl/device-state");
 
@@ -92,6 +93,7 @@ class ApiService {
               "role": role,
               "isSessionActive": isSessionActive,
               "batteryLevel": batteryLevel,
+              "chargerRelayPin": chargerRelayPin,
             }),
           )
           .timeout(const Duration(seconds: 5));
@@ -181,16 +183,18 @@ class ApiService {
     final url = Uri.parse("$baseUrl/settings/charging-config");
 
     try {
-      final response = await http.post(
-        url,
-        headers: {"Content-Type": "application/json"},
-        body: jsonEncode({
-          "settings": {
-            "startBelowPercent": startBelowPercent,
-            "stopAtPercent": stopAtPercent,
-          },
-        }),
-      ).timeout(const Duration(seconds: 5));
+      final response = await http
+          .post(
+            url,
+            headers: {"Content-Type": "application/json"},
+            body: jsonEncode({
+              "settings": {
+                "startBelowPercent": startBelowPercent,
+                "stopAtPercent": stopAtPercent,
+              },
+            }),
+          )
+          .timeout(const Duration(seconds: 5));
 
       return response.statusCode == 200;
     } catch (e) {

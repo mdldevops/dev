@@ -141,6 +141,7 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
   String? _currentCustomerRole;
   bool _isDeviceLocked = false;
   String _deviceLockMessage = 'Device is locked.';
+  int? _chargerRelayPin;
   PageRoute<dynamic>? _route;
   Timer? _resetTimer;
   Timer? _customerIdleTimer;
@@ -278,6 +279,9 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
           (currentCustomerRole == null || currentCustomerRole.isEmpty)
           ? null
           : currentCustomerRole;
+      _chargerRelayPin = int.tryParse(
+        prefs.getString(AppSettings.chargerRelayPinKey) ?? '26',
+      );
       _pendingResetRemaining =
           pendingResetRemaining == null || pendingResetRemaining.isNegative
           ? (pendingResetAt == null ? null : Duration.zero)
@@ -326,6 +330,7 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
       username: _currentCustomerUsername,
       role: _currentCustomerRole,
       batteryLevel: batteryLevel,
+      chargerRelayPin: _chargerRelayPin,
     );
   }
 

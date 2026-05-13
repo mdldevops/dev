@@ -1,3 +1,5 @@
+const { URL } = require('url');
+
 const userService = require('../services/userService');
 const { WebSocketServer } = require('ws');
 
@@ -14,14 +16,11 @@ function initializeSockets(io, httpServer) {
     });
   });
 
-  const esp32SocketServer = new WebSocketServer({
-    server: httpServer,
-    path: '/esp32',
-  });
+  const esp32SocketServer = new WebSocketServer({ noServer: true });
+  const chargerSocketServer = new WebSocketServer({ noServer: true });
 
-  const chargerSocketServer = new WebSocketServer({
-    server: httpServer,
-    path: '/charger',
+  chargerSocketServer.on('error', (error) => {
+    console.error('CHARGER SOCKET SERVER ERROR', error);
   });
 
   esp32SocketServer.on('connection', (socket, request) => {
@@ -101,6 +100,11 @@ function initializeSockets(io, httpServer) {
     socket.on('message', (rawMessage) => {
       try {
         const payload = JSON.parse(String(rawMessage || '{}'));
+        if (payload.type === 'charger_ack') {
+          userService.processChargerAck(payload);
+          return;
+        }
+
         if (payload.type !== 'register_charger') {
           return;
         }
@@ -121,8 +125,33 @@ function initializeSockets(io, httpServer) {
 
     socket.on('close', () => {
       userService.disconnectChargerClient(socket);
-      console.log('Charger controller disconnected:', request.socket.remoteAddress);
+      console.log(
+        'Charger controller disconnected:',
+        request.socket.remoteAddress,
+      );
     });
+  });
+
+  httpServer.on('upgrade', (request, socket, head) => {
+    const requestUrl = new URL(request.url || '/', 'http://localhost');
+    const pathname = requestUrl.pathname;
+
+    if (pathname === '/charger') {
+      console.log('CHARGER UPGRADE REQUEST:', request.url);
+      chargerSocketServer.handleUpgrade(request, socket, head, (wsSocket) => {
+        chargerSocketServer.emit('connection', wsSocket, request);
+      });
+      return;
+    }
+
+    if (pathname === '/esp32') {
+      esp32SocketServer.handleUpgrade(request, socket, head, (wsSocket) => {
+        esp32SocketServer.emit('connection', wsSocket, request);
+      });
+      return;
+    }
+
+    socket.destroy();
   });
 }
 

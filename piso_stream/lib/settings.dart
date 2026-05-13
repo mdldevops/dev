@@ -9,6 +9,7 @@ import 'kiosk_provisioning_page.dart';
 import 'services/admin_pin_service.dart';
 import 'services/api_service.dart';
 import 'services/audio_service.dart';
+import 'services/device_identity_service.dart';
 import 'theme_provider.dart';
 
 class SettingsPage extends StatefulWidget {
@@ -51,6 +52,7 @@ class _SettingsPageState extends State<SettingsPage> {
   final TextEditingController _chargeStopController = TextEditingController(
     text: '80',
   );
+  String _chargerRelayPin = '26';
 
   @override
   void initState() {
@@ -99,6 +101,8 @@ class _SettingsPageState extends State<SettingsPage> {
       _lowTimeAlertsSoundPath = _normalizeWallpaperPath(
         prefs.getString(AppSettings.lowTimeAlertsSoundPathKey),
       );
+      _chargerRelayPin =
+          prefs.getString(AppSettings.chargerRelayPinKey) ?? '26';
       gracePeriod =
           prefs.getString(AppSettings.gracePeriodKey) ??
           AppSettings.defaultGracePeriodLabel;
@@ -291,6 +295,7 @@ class _SettingsPageState extends State<SettingsPage> {
       AppSettings.lowTimeAlertsSoundPathKey,
       _lowTimeAlertsSoundPath ?? '',
     );
+    await prefs.setString(AppSettings.chargerRelayPinKey, _chargerRelayPin);
     await prefs.setString(AppSettings.gracePeriodKey, gracePeriod);
     if (!isDeepFreezeEnabled) {
       await prefs.remove(AppSettings.pendingResetAtKey);
@@ -329,6 +334,26 @@ class _SettingsPageState extends State<SettingsPage> {
     final chargingSaved = await ApiService.updateChargingConfig(
       startBelowPercent: startBelowPercent,
       stopAtPercent: stopAtPercent,
+    );
+
+    final deviceId = await DeviceIdentityService.getOrCreateDeviceId();
+    int? batteryLevel;
+    try {
+      final result = await _platformChannel.invokeMapMethod<String, dynamic>(
+        'getSystemStatus',
+      );
+      batteryLevel = (result?['batteryLevel'] as num?)?.toInt();
+    } on PlatformException {
+      batteryLevel = null;
+    }
+
+    await ApiService.updateDeviceState(
+      deviceId: deviceId,
+      status: 'online',
+      remainingSeconds: 0,
+      isSessionActive: false,
+      batteryLevel: batteryLevel,
+      chargerRelayPin: int.tryParse(_chargerRelayPin) ?? 26,
     );
 
     if (!mounted) {
@@ -1005,6 +1030,57 @@ class _SettingsPageState extends State<SettingsPage> {
                       "Open Wi-Fi settings for admin connection changes",
                       Icons.wifi,
                       onTap: _openWifiSettings,
+                    ),
+                    ExpansionTile(
+                      leading: const Icon(
+                        Icons.electrical_services,
+                        color: Colors.lightGreenAccent,
+                      ),
+                      title: const Text(
+                        "Charging Relay Assignment",
+                        style: TextStyle(color: Colors.white),
+                      ),
+                      subtitle: const Text(
+                        "Choose which relay pin this launcher controls.",
+                        style: TextStyle(color: Colors.white70),
+                      ),
+                      children: [
+                        Padding(
+                          padding: const EdgeInsets.all(16.0),
+                          child: DropdownButtonFormField<String>(
+                            dropdownColor: const Color(0xFF1A1A1A),
+                            style: const TextStyle(color: Colors.white),
+                            iconEnabledColor: Colors.white70,
+                            decoration: const InputDecoration(
+                              labelText: "Relay PIN",
+                              labelStyle: TextStyle(color: Colors.white70),
+                            ),
+                            initialValue: _chargerRelayPin,
+                            items:
+                                const ['26', '27', '32', '33']
+                                    .map(
+                                      (pin) => DropdownMenuItem(
+                                        value: pin,
+                                        child: Text(
+                                          'Relay $pin',
+                                          style: const TextStyle(
+                                            color: Colors.white,
+                                          ),
+                                        ),
+                                      ),
+                                    )
+                                    .toList(),
+                            onChanged: (value) {
+                              if (value == null) {
+                                return;
+                              }
+                              setState(() {
+                                _chargerRelayPin = value;
+                              });
+                            },
+                          ),
+                        ),
+                      ],
                     ),
                     ExpansionTile(
                       leading: const Icon(

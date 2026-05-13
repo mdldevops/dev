@@ -28,6 +28,7 @@ class AppSettings {
   static const String lowTimeAlertsSoundPathKey = 'low_time_alerts_sound_path';
   static const String lowTimeAlertsVibrationEnabledKey =
       'low_time_alerts_vibration_enabled';
+  static const String chargerRelayPinKey = 'charger_relay_pin';
   static const String defaultGracePeriodLabel = '1 minute';
 
   static Duration gracePeriodFromLabel(String? label) {
