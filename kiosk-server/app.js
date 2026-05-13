@@ -17,6 +17,10 @@ const app = express();
 const corsOptions = buildCorsOptions();
 const adminDistPath = path.resolve(__dirname, '../piso-stream-admin/dist');
 const adminIndexPath = path.join(adminDistPath, 'index.html');
+const rawAdminBasePath = String(process.env.ADMIN_BASE_PATH || '/portal').trim();
+const adminBasePath = rawAdminBasePath === '/'
+  ? '/'
+  : `/${rawAdminBasePath.replace(/^\/+|\/+$/g, '')}`;
 const hasAdminBuild =
   fs.existsSync(adminDistPath) && fs.existsSync(adminIndexPath);
 
@@ -69,9 +73,9 @@ app.get('/settings/audio-config', userController.getAudioSettings);
 app.post('/settings/audio-config', userController.updateAudioSettings);
 
 if (hasAdminBuild) {
-  app.use(express.static(adminDistPath));
+  app.use(adminBasePath, express.static(adminDistPath));
 
-  app.get(/^\/(?!auth\/|admin\/|customers(?:\/|$)|broadcast$|settings\/|device-state$|devices(?:\/|$)|sessions(?:\/|$)|sales\/|start-session$|confirm-session$|release-session$|health$|socket\.io\/?).*/, (_req, res) => {
+  app.get(`${adminBasePath}/*splat`, (_req, res) => {
     res.sendFile(adminIndexPath);
   });
 }

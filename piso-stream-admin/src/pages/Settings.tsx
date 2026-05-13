@@ -2,7 +2,8 @@ import React, { useEffect, useState } from 'react';
 import { useStore } from '../store/useStore';
 
 const API_BASE_URL =
-  import.meta.env.VITE_API_BASE_URL?.trim() || 'http://192.168.1.7:523';
+  import.meta.env.VITE_API_BASE_URL?.trim() ||
+  (typeof window !== 'undefined' ? window.location.origin : 'http://192.168.1.7:523');
 
 export default function Settings() {
   const { settings, updateSettings, broadcast } = useStore();

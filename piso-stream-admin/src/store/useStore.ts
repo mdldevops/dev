@@ -39,7 +39,8 @@ interface AppState {
 }
 
 const API_BASE_URL =
-  import.meta.env.VITE_API_BASE_URL?.trim() || 'www.server.pisostream.online';
+  import.meta.env.VITE_API_BASE_URL?.trim() ||
+  (typeof window !== 'undefined' ? window.location.origin : 'http://192.168.1.7:523');
 
 const toDateKey = (value: string | undefined | null) => {
   return String(value || '').split(/[ T]/)[0] || '';
