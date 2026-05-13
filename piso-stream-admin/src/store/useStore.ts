@@ -39,7 +39,7 @@ interface AppState {
 }
 
 const API_BASE_URL =
-  import.meta.env.VITE_API_BASE_URL?.trim() || 'http://192.168.1.7:523';
+  import.meta.env.VITE_API_BASE_URL?.trim() || 'www.server.pisostream.online';
 
 const toDateKey = (value: string | undefined | null) => {
   return String(value || '').split(/[ T]/)[0] || '';

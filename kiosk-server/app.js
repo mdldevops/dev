@@ -1,3 +1,5 @@
+const fs = require('fs');
+const path = require('path');
 const express = require('express');
 const cors = require('cors');
 
@@ -13,6 +15,10 @@ require('./src/config/database');
 
 const app = express();
 const corsOptions = buildCorsOptions();
+const adminDistPath = path.resolve(__dirname, '../piso-stream-admin/dist');
+const adminIndexPath = path.join(adminDistPath, 'index.html');
+const hasAdminBuild =
+  fs.existsSync(adminDistPath) && fs.existsSync(adminIndexPath);
 
 app.set('trust proxy', 1);
 app.use(cors(corsOptions));
@@ -61,5 +67,13 @@ app.post('/confirm-session', userController.confirmSession);
 app.post('/release-session', userController.releaseSession);
 app.get('/settings/audio-config', userController.getAudioSettings);
 app.post('/settings/audio-config', userController.updateAudioSettings);
+
+if (hasAdminBuild) {
+  app.use(express.static(adminDistPath));
+
+  app.get(/^\/(?!auth\/|admin\/|customers(?:\/|$)|broadcast$|settings\/|device-state$|devices(?:\/|$)|sessions(?:\/|$)|sales\/|start-session$|confirm-session$|release-session$|health$|socket\.io\/?).*/, (_req, res) => {
+    res.sendFile(adminIndexPath);
+  });
+}
 
 module.exports = app;
