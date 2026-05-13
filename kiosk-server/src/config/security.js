@@ -1,7 +1,7 @@
 const rateLimit = require('express-rate-limit');
 
 function getAllowedOrigins() {
-  const rawOrigins = process.env.ALLOWED_ORIGINS || 'http://192.168.1.7:1523';
+  const rawOrigins = process.env.ALLOWED_ORIGINS || 'www.portal.pisostream.online';
 
   return rawOrigins
     .split(',')
