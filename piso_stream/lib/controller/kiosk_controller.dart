@@ -86,7 +86,7 @@ class KioskController {
   Future<void> initialize() async {
     print("Initializing kiosk...");
 
-    socket = SocketService(url: ApiService.baseUrl, deviceId: deviceId);
+    socket = SocketService(url: ApiService.socketUrl, deviceId: deviceId);
 
     _handleEvent = (data) {
       final event = data['event'];

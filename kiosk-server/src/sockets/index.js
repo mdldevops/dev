@@ -150,8 +150,6 @@ function initializeSockets(io, httpServer) {
       });
       return;
     }
-
-    socket.destroy();
   });
 }
 

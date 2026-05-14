@@ -8,15 +8,21 @@
 // --- CONFIGURATION ---
 const char* ssid = "Loading...";         // Replace with your WiFi SSID
 const char* password = "MdlJcrZfrlZvrl11@2.4G"; // Replace with your WiFi Password
-const char* ws_host = "192.168.1.18";      // Replace with your Node.js Server IP
-const int ws_port = 3000;
+const char* ws_host = "portal.pisostream.online";
+const int ws_port = 443;
 const char* ws_path = "/esp32";
+const bool ws_secure = true;
 const char* bootstrapLauncherDeviceName = "";  // Optional only for dedicated pairing; leave blank for shared-acceptor mode
 String launcherDeviceId = ""; // Launcher device ID is assigned dynamically from the server payload
 String launcherDeviceName = bootstrapLauncherDeviceName;  // Bootstrap name used until server assigns/persists values
 const int acceptorEnablePin = 26;           // Set your acceptor control GPIO here, or leave -1 for software-only gating
 const bool acceptorEnabledLevel = HIGH;      // Change if your acceptor enable line is active HIGH
 const unsigned long acceptorOpenDelayMs = 100;
+const unsigned long wifiReconnectIntervalMs = 10000;
+const unsigned long registerRefreshIntervalMs = 30000;
+const unsigned long websocketHeartbeatIntervalMs = 15000;
+const unsigned long websocketHeartbeatTimeoutMs = 3000;
+const uint8_t websocketHeartbeatDisconnectCount = 2;
 
 // --- PERSISTENCE & SYNC ---
 Preferences prefs;
@@ -50,6 +56,8 @@ long lastTxId = 0;
 bool waitingForAck = false;
 unsigned long lastRetryTime = 0;
 const int retryInterval = 5000; // Retry every 5 seconds
+unsigned long lastWifiReconnectAttemptMs = 0;
+unsigned long lastRegisterSentMs = 0;
 
 WebSocketsClient webSocket;
 String deviceId;
@@ -117,7 +125,24 @@ void registerToServer() {
   String output;
   serializeJson(doc, output);
   webSocket.sendTXT(output);
+  lastRegisterSentMs = millis();
   Serial.println("[PisoStream] Registering: " + output);
+}
+
+void ensureWifiConnected() {
+  if (WiFi.status() == WL_CONNECTED) {
+    return;
+  }
+
+  const unsigned long now = millis();
+  if (now - lastWifiReconnectAttemptMs < wifiReconnectIntervalMs) {
+    return;
+  }
+
+  lastWifiReconnectAttemptMs = now;
+  Serial.println("[PisoStream] Wi-Fi disconnected. Reconnecting...");
+  WiFi.disconnect();
+  WiFi.begin(ssid, password);
 }
 
 // Interrupt function for coin pulses
@@ -163,7 +188,7 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
       // If we have unsent money from a previous session, send it now
       if (waitingForAck) syncCreditToServer();
       break;
-    case WStype_TEXT:
+    case WStype_TEXT: {
       JsonDocument res;
       deserializeJson(res, payload);
 
@@ -205,6 +230,16 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
         pendingAmount = 0;
       }
       break;
+    }
+    case WStype_PING:
+      Serial.println("[WS] Ping received");
+      break;
+    case WStype_PONG:
+      Serial.println("[WS] Pong received");
+      break;
+    case WStype_ERROR:
+      Serial.println("[WS] WebSocket error");
+      break;
   }
 }
 
@@ -245,15 +280,42 @@ void setup() {
     Serial.print(".");
   }
   Serial.println("\nWiFi Connected!");
+  Serial.println("[PisoStream] Local IP: " + WiFi.localIP().toString());
 
   // 4. Start WebSocket
-  webSocket.begin(ws_host, ws_port, ws_path);
+  Serial.println(
+    String("[PisoStream] WebSocket URL: ") +
+    (ws_secure ? "wss://" : "ws://") +
+    ws_host +
+    ":" +
+    ws_port +
+    ws_path
+  );
+  if (ws_secure) {
+    webSocket.beginSSL(ws_host, ws_port, ws_path);
+  } else {
+    webSocket.begin(ws_host, ws_port, ws_path);
+  }
   webSocket.onEvent(webSocketEvent);
   webSocket.setReconnectInterval(5000);
+  webSocket.enableHeartbeat(
+    websocketHeartbeatIntervalMs,
+    websocketHeartbeatTimeoutMs,
+    websocketHeartbeatDisconnectCount
+  );
 }
 
 void loop() {
+  ensureWifiConnected();
   webSocket.loop();
+
+  if (
+    WiFi.status() == WL_CONNECTED &&
+    webSocket.isConnected() &&
+    millis() - lastRegisterSentMs >= registerRefreshIntervalMs
+  ) {
+    registerToServer();
+  }
 
   if (acceptorOpenPending && static_cast<long>(millis() - acceptorOpenAt) >= 0) {
     acceptorOpenPending = false;

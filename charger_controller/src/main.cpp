@@ -7,9 +7,10 @@
 
 const char* ssid = "Loading...";
 const char* password = "MdlJcrZfrlZvrl11@2.4G";
-const char* wsHost = "192.168.1.7";
-const int wsPort = 3000;
+const char* wsHost = "portal.pisostream.online";
+const int wsPort = 443;
 const char* wsPath = "/charger";
+const bool wsSecure = true;
 
 const char* bootstrapLauncherDeviceName = "";
 String launcherDeviceId = "";
@@ -255,10 +256,19 @@ void setup() {
   Serial.println("\n[Charger] Wi-Fi connected");
   Serial.println("[Charger] Local IP: " + WiFi.localIP().toString());
   Serial.println(
-    String("[Charger] WebSocket URL: ws://") + wsHost + ":" + wsPort + wsPath
+    String("[Charger] WebSocket URL: ") +
+    (wsSecure ? "wss://" : "ws://") +
+    wsHost +
+    ":" +
+    wsPort +
+    wsPath
   );
 
-  webSocket.begin(wsHost, wsPort, wsPath);
+  if (wsSecure) {
+    webSocket.beginSSL(wsHost, wsPort, wsPath);
+  } else {
+    webSocket.begin(wsHost, wsPort, wsPath);
+  }
   webSocket.onEvent(webSocketEvent);
   webSocket.setReconnectInterval(5000);
   webSocket.enableHeartbeat(

@@ -9,7 +9,11 @@ class DeviceStatusResult {
 }
 
 class ApiService {
-  static const String baseUrl = "http://192.168.1.7:3000";
+  static final Uri _serverUri = Uri.parse("https://portal.pisostream.online");
+
+  static String get baseUrl => _serverUri.origin;
+
+  static String get socketUrl => _serverUri.origin;
 
   static Future<Map<String, dynamic>?> startSession(
     String deviceId, {

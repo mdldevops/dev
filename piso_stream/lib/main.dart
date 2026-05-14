@@ -55,7 +55,7 @@ class _MyAppState extends State<MyApp> {
   Future<void> _initializeSharedSocket() async {
     final deviceId = await DeviceIdentityService.getOrCreateDeviceId();
     final sharedSocket = SocketService(
-      url: ApiService.baseUrl,
+      url: ApiService.socketUrl,
       deviceId: deviceId,
     );
     sharedSocket.addBroadcastListener(_showBroadcastPopup);

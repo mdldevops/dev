@@ -331,11 +331,6 @@ class _SettingsPageState extends State<SettingsPage> {
       return;
     }
 
-    final chargingSaved = await ApiService.updateChargingConfig(
-      startBelowPercent: startBelowPercent,
-      stopAtPercent: stopAtPercent,
-    );
-
     final deviceId = await DeviceIdentityService.getOrCreateDeviceId();
     int? batteryLevel;
     try {
@@ -354,6 +349,11 @@ class _SettingsPageState extends State<SettingsPage> {
       isSessionActive: false,
       batteryLevel: batteryLevel,
       chargerRelayPin: int.tryParse(_chargerRelayPin) ?? 26,
+    );
+
+    final chargingSaved = await ApiService.updateChargingConfig(
+      startBelowPercent: startBelowPercent,
+      stopAtPercent: stopAtPercent,
     );
 
     if (!mounted) {
@@ -1285,8 +1285,10 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
         ),
         const SizedBox(height: 12),
-        Row(
-          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+        Wrap(
+          alignment: WrapAlignment.center,
+          spacing: 12,
+          runSpacing: 12,
           children: [
             OutlinedButton(
               onPressed: _pickAudioFile,
@@ -1329,8 +1331,10 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
         ),
         const SizedBox(height: 12),
-        Row(
-          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+        Wrap(
+          alignment: WrapAlignment.center,
+          spacing: 12,
+          runSpacing: 12,
           children: [
             OutlinedButton(
               onPressed: _pickCoinAudioFile,

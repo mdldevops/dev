@@ -237,6 +237,10 @@ async function updateChargingSettings(settings = {}) {
     throw error;
   }
 
+  const settingsChanged =
+    nextSettings.startBelowPercent !== chargingSettingsCache.startBelowPercent ||
+    nextSettings.stopAtPercent !== chargingSettingsCache.stopAtPercent;
+
   await runQuery(
     `
       UPDATE charging_settings
@@ -250,9 +254,11 @@ async function updateChargingSettings(settings = {}) {
   );
 
   chargingSettingsCache = nextSettings;
-  Object.keys(runtimeDeviceStates).forEach((deviceId) => {
-    evaluateChargingForDevice(deviceId);
-  });
+  if (settingsChanged) {
+    Object.keys(runtimeDeviceStates).forEach((deviceId) => {
+      evaluateChargingForDevice(deviceId, { forceReevaluate: true });
+    });
+  }
 
   return {
     success: true,
@@ -528,11 +534,13 @@ function sendChargerCommand({
   return true;
 }
 
-function evaluateChargingForDevice(deviceId) {
+function evaluateChargingForDevice(deviceId, options = {}) {
   const normalizedDeviceId = String(deviceId || '').trim();
   if (!normalizedDeviceId) {
     return;
   }
+
+  const forceReevaluate = options.forceReevaluate === true;
 
   const runtimeState = runtimeDeviceStates[normalizedDeviceId];
   if (!runtimeState) {
@@ -547,7 +555,9 @@ function evaluateChargingForDevice(deviceId) {
   const previousState = chargingRelayStates[normalizedDeviceId];
   let nextShouldCharge = previousState;
 
-  if (batteryLevel <= chargingSettingsCache.startBelowPercent) {
+  if (forceReevaluate) {
+    nextShouldCharge = batteryLevel <= chargingSettingsCache.startBelowPercent;
+  } else if (batteryLevel <= chargingSettingsCache.startBelowPercent) {
     nextShouldCharge = true;
   } else if (batteryLevel >= chargingSettingsCache.stopAtPercent) {
     nextShouldCharge = false;
@@ -561,6 +571,7 @@ function evaluateChargingForDevice(deviceId) {
 
   const pendingState = chargingCommandPendingStates[normalizedDeviceId];
   if (
+    !forceReevaluate &&
     pendingState &&
     pendingState.enabled === nextShouldCharge &&
     Date.now() - Number(pendingState.requestedAt || 0) <= 15000
