@@ -169,7 +169,7 @@ class SocketService {
       print("Socket disconnected");
       isConnected = false;
       _connecting = false;
-      _connectionCompleter = Completer<void>();
+      _connectionCompleter ??= Completer<void>();
 
       for (final listener in List<void Function()>.from(
         _disconnectedListeners,
@@ -197,15 +197,10 @@ class SocketService {
       isConnected = false;
       _connecting = false;
 
-      if (!(_connectionCompleter?.isCompleted ?? true)) {
-        _connectionCompleter!.completeError(err);
-      }
-
       for (final listener in List<void Function(String)>.from(_errorListeners)) {
         listener('connect_error: $err');
       }
 
-      _connectionCompleter = Completer<void>();
       _scheduleReconnect();
     });
   }

@@ -80,10 +80,7 @@ class _MyAppState extends State<MyApp> {
             'Admin Broadcast',
             style: TextStyle(color: Colors.white),
           ),
-          content: Text(
-            message,
-            style: const TextStyle(color: Colors.white70),
-          ),
+          content: Text(message, style: const TextStyle(color: Colors.white70)),
           actions: [
             TextButton(
               onPressed: () => Navigator.of(dialogContext).pop(),
@@ -126,6 +123,7 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
     with RouteAware, WidgetsBindingObserver {
   static const String _defaultBusinessName = 'PISO STREAM';
   static const String _defaultDeviceName = 'CP1';
+  static const String _launcherVersion = 'Launcher v1.0.2+2';
   static const MethodChannel _platformChannel = MethodChannel(
     'com.example.piso_stream/installed_apps',
   );
@@ -189,6 +187,11 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
   }
 
   @override
+  void didPushNext() {
+    _deviceStateTimer?.cancel();
+  }
+
+  @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       _enableKioskMode();
@@ -201,6 +204,14 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
       await _platformChannel.invokeMethod<void>('enterKioskMode');
     } on PlatformException {
       // Best effort only. Full kiosk enforcement depends on device policy.
+    }
+  }
+
+  Future<void> _refreshNativeKioskPolicies() async {
+    try {
+      await _platformChannel.invokeMethod<void>('enterKioskMode');
+    } on PlatformException {
+      // Best effort only. Native side may still re-apply on resume/app launch.
     }
   }
 
@@ -239,6 +250,21 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
     final idleDeadline = idleDeadlineMillis == null
         ? null
         : DateTime.fromMillisecondsSinceEpoch(idleDeadlineMillis);
+    final didExpire =
+        prefs.getBool(AppSettings.sessionExpiredPendingKey) ?? false;
+    var showExpiredSnackbar = false;
+
+    if (didExpire) {
+      await prefs.remove(AppSettings.sessionExpiredPendingKey);
+      showExpiredSnackbar = true;
+      if (currentCustomer != null &&
+          currentCustomer.isNotEmpty &&
+          currentCustomerRole != 'admin') {
+        await CustomerAccountService.clearCurrentCustomer();
+        currentCustomer = null;
+        currentCustomerRole = null;
+      }
+    }
 
     if (currentCustomer != null &&
         currentCustomer.isNotEmpty &&
@@ -288,6 +314,20 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
           : pendingResetRemaining;
     });
 
+    if (showExpiredSnackbar) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) {
+          return;
+        }
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Session expired and you have been logged out.'),
+          ),
+        );
+      });
+    }
+
     _startResetWatcher();
     await _startCustomerIdleTimer();
     await _refreshDeviceLockStatus();
@@ -321,12 +361,24 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
       return;
     }
 
+    final prefs = await SharedPreferences.getInstance();
+    final expiresAtMillis = prefs.getInt(AppSettings.sessionExpiresAtKey);
+    final expiresAt = expiresAtMillis == null
+        ? null
+        : DateTime.fromMillisecondsSinceEpoch(expiresAtMillis);
+    final hasSessionExpiry =
+        expiresAt != null && expiresAt.isAfter(DateTime.now());
+    final isActiveCustomerSession =
+        (_currentCustomerRole ?? 'customer') != 'admin' && hasSessionExpiry;
+    final remainingSeconds = isActiveCustomerSession
+        ? expiresAt!.difference(DateTime.now()).inSeconds.clamp(0, 864000)
+        : 0;
     final batteryLevel = await _getBatteryLevel();
     await ApiService.updateDeviceState(
       deviceId: deviceId,
       status: 'online',
-      remainingSeconds: 0,
-      isSessionActive: false,
+      remainingSeconds: remainingSeconds,
+      isSessionActive: isActiveCustomerSession,
       username: _currentCustomerUsername,
       role: _currentCustomerRole,
       batteryLevel: batteryLevel,
@@ -412,6 +464,14 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
     final packages =
         prefs.getStringList(AppSettings.allowedAppsKey) ?? <String>[];
 
+    try {
+      await _platformChannel.invokeMethod<void>('returnLauncherToFront');
+    } on PlatformException {
+      // Best effort only.
+    }
+
+    await CustomerAccountService.clearCurrentCustomer();
+
     if (packages.isNotEmpty) {
       try {
         await _platformChannel.invokeMethod<void>(
@@ -431,7 +491,15 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
 
     setState(() {
       _pendingResetRemaining = null;
+      _currentCustomerUsername = null;
+      _currentCustomerRole = null;
     });
+
+    try {
+      await _platformChannel.invokeMethod<void>('restartApp');
+    } on PlatformException {
+      // Best effort only.
+    }
   }
 
   Future<void> _startCoinSession(String? wallpaperPath) async {
@@ -440,9 +508,9 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
         return;
       }
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(_deviceLockMessage)),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(_deviceLockMessage)));
       return;
     }
 
@@ -458,7 +526,9 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
 
     if (sessionResult == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Unable to contact the server right now.')),
+        const SnackBar(
+          content: Text('Unable to contact the server right now.'),
+        ),
       );
       return;
     }
@@ -543,6 +613,7 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
   Future<void> _logoutCustomer({required bool showMessage}) async {
     _customerIdleTimer?.cancel();
     await CustomerAccountService.clearCurrentCustomer();
+    await _refreshNativeKioskPolicies();
 
     if (!mounted) {
       return;
@@ -583,6 +654,7 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
         result.username,
         role: result.role,
       );
+      await _refreshNativeKioskPolicies();
 
       if (!mounted) {
         return;
@@ -794,6 +866,27 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
                           fontSize: 20,
                           letterSpacing: 3,
                           fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 6,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withValues(alpha: 0.28),
+                          borderRadius: BorderRadius.circular(999),
+                          border: Border.all(color: Colors.white12),
+                        ),
+                        child: const Text(
+                          _launcherVersion,
+                          style: TextStyle(
+                            color: Colors.white70,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                            letterSpacing: 0.3,
+                          ),
                         ),
                       ),
                       const SizedBox(height: 16),

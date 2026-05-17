@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:file_picker/file_picker.dart';
@@ -32,7 +34,7 @@ class _SettingsPageState extends State<SettingsPage> {
   double _volume = 0.5;
   bool _audioEnabled = false;
   bool _audioLoop = true;
-  bool _allowAppUpdates = true;
+  bool _allowAppUpdates = false;
   String? _audioPath;
   bool _coinAudioEnabled = false;
   String? _coinAudioPath;
@@ -46,6 +48,10 @@ class _SettingsPageState extends State<SettingsPage> {
   String? _landscapeWallpaperPath;
   bool? _isDeviceOwnerActive;
   bool _isApplyingKioskPolicies = false;
+  Timer? _activeSessionTimer;
+  String? _activeSessionCustomer;
+  String? _activeSessionRole;
+  Duration? _activeSessionRemaining;
   final TextEditingController _chargeStartController = TextEditingController(
     text: '30',
   );
@@ -59,8 +65,11 @@ class _SettingsPageState extends State<SettingsPage> {
     super.initState();
     _loadSavedSettings();
     _loadDeviceOwnerStatus();
+    _loadActiveSessionState();
+    _startActiveSessionWatcher();
   }
 
+  @override
   Future<void> _loadSavedSettings() async {
     final prefs = await SharedPreferences.getInstance();
 
@@ -82,7 +91,7 @@ class _SettingsPageState extends State<SettingsPage> {
       isDeepFreezeEnabled =
           prefs.getBool(AppSettings.deepFreezeEnabledKey) ?? false;
       _allowAppUpdates =
-          prefs.getBool(AppSettings.allowAppUpdatesKey) ?? true;
+          prefs.getBool(AppSettings.allowAppUpdatesKey) ?? false;
       _audioEnabled = prefs.getBool(AppSettings.audioEnabledKey) ?? false;
       _audioLoop = prefs.getBool(AppSettings.audioLoopKey) ?? true;
       _volume = prefs.getDouble(AppSettings.audioVolumeKey) ?? 0.5;
@@ -148,6 +157,81 @@ class _SettingsPageState extends State<SettingsPage> {
         _isDeviceOwnerActive = false;
       });
     }
+  }
+
+  void _startActiveSessionWatcher() {
+    _activeSessionTimer?.cancel();
+    _activeSessionTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      _loadActiveSessionState();
+    });
+  }
+
+  Future<void> _loadActiveSessionState() async {
+    final prefs = await SharedPreferences.getInstance();
+    final customer = prefs.getString(AppSettings.currentCustomerKey)?.trim();
+    final role = prefs.getString(AppSettings.currentCustomerRoleKey)?.trim();
+    final expiresAtMillis = prefs.getInt(AppSettings.sessionExpiresAtKey);
+    final remaining = expiresAtMillis == null
+        ? null
+        : DateTime.fromMillisecondsSinceEpoch(expiresAtMillis).difference(
+            DateTime.now(),
+          );
+
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _activeSessionCustomer =
+          customer == null || customer.isEmpty ? null : customer;
+      _activeSessionRole = role == null || role.isEmpty ? null : role;
+      _activeSessionRemaining = remaining == null
+          ? null
+          : (remaining.isNegative ? Duration.zero : remaining);
+    });
+  }
+
+  String _formatRemaining(Duration duration) {
+    final totalSeconds = duration.inSeconds.clamp(0, 359999);
+    final hours = totalSeconds ~/ 3600;
+    final minutes = (totalSeconds % 3600) ~/ 60;
+    final seconds = totalSeconds % 60;
+
+    if (hours > 0) {
+      return '${hours.toString().padLeft(2, '0')}:${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}';
+    }
+
+    return '${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}';
+  }
+
+  Widget _buildActiveSessionCard() {
+    final hasActiveSession =
+        _activeSessionRemaining != null &&
+        _activeSessionRemaining! > Duration.zero;
+
+    final title = hasActiveSession ? 'Active Session' : 'No Active Session';
+    final subtitle = hasActiveSession
+        ? '${_activeSessionCustomer ?? 'Guest Session'} (${_activeSessionRole ?? (_activeSessionCustomer == null ? 'walk-in' : 'customer')})\nRemaining: ${_formatRemaining(_activeSessionRemaining!)}'
+        : 'No customer session is currently running on this device.';
+
+    return Card(
+      color: const Color(0xFF1A1A1A),
+      margin: const EdgeInsets.only(bottom: 12),
+      child: ListTile(
+        leading: Icon(
+          hasActiveSession ? Icons.timer : Icons.timer_off,
+          color: hasActiveSession ? Colors.cyanAccent : Colors.white54,
+        ),
+        title: Text(
+          title,
+          style: const TextStyle(color: Colors.white),
+        ),
+        subtitle: Text(
+          subtitle,
+          style: const TextStyle(color: Colors.white70),
+        ),
+      ),
+    );
   }
 
   Future<void> _applyKioskPolicies() async {
@@ -838,6 +922,7 @@ class _SettingsPageState extends State<SettingsPage> {
 
   @override
   void dispose() {
+    _activeSessionTimer?.cancel();
     AudioService().stopAudio();
     _businessNameController.dispose();
     _deviceNameController.dispose();
@@ -867,6 +952,7 @@ class _SettingsPageState extends State<SettingsPage> {
                 child: ListView(
                   padding: const EdgeInsets.all(16),
                   children: [
+                    _buildActiveSessionCard(),
                     _buildTile(
                       "Change Admin PIN",
                       "Update your admin access PIN",
@@ -961,11 +1047,13 @@ class _SettingsPageState extends State<SettingsPage> {
                         ),
                         SwitchListTile(
                           title: Text(
-                            _allowAppUpdates ? "App Updates Allowed" : "App Updates Blocked",
+                            _allowAppUpdates
+                                ? "Admin App Installs Enabled"
+                                : "Admin App Installs Disabled",
                             style: const TextStyle(color: Colors.white),
                           ),
                           subtitle: const Text(
-                            "Allow updating installed and whitelisted apps while kiosk mode is active",
+                            "When enabled, only admin sessions can install or update apps. Customers are always blocked.",
                             style: TextStyle(color: Colors.white70),
                           ),
                           value: _allowAppUpdates,

@@ -129,10 +129,19 @@ class ApiService {
   }
 
   static Future<DeviceStatusResult?> getDeviceStatus(String deviceId) async {
-    final url = Uri.parse("$baseUrl/devices/$deviceId/status");
+    final url = Uri.parse(
+      "$baseUrl/devices/$deviceId/status",
+    ).replace(queryParameters: {'_t': DateTime.now().millisecondsSinceEpoch.toString()});
 
     try {
-      final res = await http.get(url).timeout(const Duration(seconds: 5));
+      final res = await http.get(
+        url,
+        headers: const {
+          'Cache-Control': 'no-cache, no-store, must-revalidate',
+          'Pragma': 'no-cache',
+          'Expires': '0',
+        },
+      ).timeout(const Duration(seconds: 5));
       if (res.statusCode != 200) {
         return null;
       }
@@ -149,10 +158,19 @@ class ApiService {
   }
 
   static Future<Map<String, dynamic>?> getSessionState(String deviceId) async {
-    final url = Uri.parse("$baseUrl/sessions/$deviceId/state");
+    final url = Uri.parse(
+      "$baseUrl/sessions/$deviceId/state",
+    ).replace(queryParameters: {'_t': DateTime.now().millisecondsSinceEpoch.toString()});
 
     try {
-      final response = await http.get(url).timeout(const Duration(seconds: 5));
+      final response = await http.get(
+        url,
+        headers: const {
+          'Cache-Control': 'no-cache, no-store, must-revalidate',
+          'Pragma': 'no-cache',
+          'Expires': '0',
+        },
+      ).timeout(const Duration(seconds: 5));
 
       if (response.statusCode != 200) {
         return null;

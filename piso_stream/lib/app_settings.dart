@@ -12,6 +12,7 @@ class AppSettings {
   static const String pendingResetAtKey = 'pending_reset_at';
   static const String currentCustomerKey = 'current_customer_username';
   static const String currentCustomerRoleKey = 'current_customer_role';
+  static const String sessionExpiresAtKey = 'session_expires_at';
   static const String customerIdleDeadlineKey = 'customer_idle_deadline';
   static const String kioskDeviceIdKey = 'kiosk_device_id';
   static const String kioskDeviceTokenKey = 'kiosk_device_token';
@@ -29,6 +30,8 @@ class AppSettings {
   static const String lowTimeAlertsVibrationEnabledKey =
       'low_time_alerts_vibration_enabled';
   static const String chargerRelayPinKey = 'charger_relay_pin';
+  static const String sessionExpiredPendingKey = 'session_expired_pending';
+  static const String nativeCloseDebugKey = 'native_close_debug';
   static const String defaultGracePeriodLabel = '1 minute';
 
   static Duration gracePeriodFromLabel(String? label) {

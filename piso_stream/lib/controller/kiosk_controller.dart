@@ -17,6 +17,7 @@ class KioskController {
   bool isActive = false;
   bool isConnected = false;
   Timer? _sessionStatePoller;
+  bool _isSyncingSessionState = false;
 
   Function(int total, int minutes)? onUpdate;
   Function()? onSessionStarted;
@@ -41,9 +42,7 @@ class KioskController {
     if (status == 'started') {
       final nextTotal = (data['total'] as num?)?.toInt() ?? total;
       final nextMinutes = (data['time'] as num?)?.toInt() ?? minutes;
-      final addedMinutes = nextMinutes >= minutes
-          ? nextMinutes - minutes
-          : nextMinutes;
+      final addedMinutes = nextMinutes > minutes ? nextMinutes - minutes : 0;
       final wasActive = isActive;
 
       isActive = true;
@@ -65,7 +64,14 @@ class KioskController {
   }
 
   Future<void> _syncSessionState() async {
+    if (_isSyncingSessionState) {
+      return;
+    }
+
+    _isSyncingSessionState = true;
     final result = await ApiService.getSessionState(deviceId);
+    _isSyncingSessionState = false;
+
     if (result == null) {
       return;
     }
@@ -96,9 +102,9 @@ class KioskController {
           if (data['deviceId'] == deviceId) {
             final nextTotal = (data['total'] as num?)?.toInt() ?? total;
             final nextMinutes = (data['time'] as num?)?.toInt() ?? minutes;
-            final addedMinutes = nextMinutes >= minutes
+            final addedMinutes = nextMinutes > minutes
                 ? nextMinutes - minutes
-                : nextMinutes;
+                : 0;
 
             total = nextTotal;
             minutes = nextMinutes;

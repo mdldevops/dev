@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -7,7 +8,6 @@ import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'app_settings.dart';
-import 'admin_login.dart';
 import 'coin_session_page.dart';
 import 'customer_auth_page.dart';
 import 'main.dart';
@@ -56,13 +56,24 @@ class _MenuPageState extends State<MenuPage> {
   String? _currentCustomerRole;
   String? _deviceId;
   int? _chargerRelayPin;
+  DateTime? _sessionExpiresAt;
   bool _sentOneMinuteWarning = false;
   bool _sentTwentySecondWarning = false;
+  bool _sessionExpiredHandled = false;
+
+  bool get _isFinalCountdownLocked =>
+      !widget.isOpenTime &&
+      _remainingTime > Duration.zero &&
+      _remainingTime.inSeconds <= _secondSessionWarningSeconds;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(_lifecycleObserver);
     _remainingTime = widget.initialSessionTime;
+    _sessionExpiresAt = widget.isOpenTime
+        ? null
+        : DateTime.now().add(widget.initialSessionTime);
     _sentOneMinuteWarning =
         widget.initialSessionTime.inSeconds < _firstSessionWarningSeconds;
     _sentTwentySecondWarning =
@@ -79,11 +90,17 @@ class _MenuPageState extends State<MenuPage> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(_lifecycleObserver);
     _timer?.cancel();
     _deviceStateTimer?.cancel();
+    unawaited(_cancelSessionMonitoring());
     unawaited(_cancelSessionWarningNotification());
     super.dispose();
   }
+
+  late final WidgetsBindingObserver _lifecycleObserver = _MenuLifecycleObserver(
+    onResumed: _handleResumeChecks,
+  );
 
   Future<void> _initializeDeviceStateSync() async {
     _deviceId = await DeviceIdentityService.getOrCreateDeviceId();
@@ -91,7 +108,17 @@ class _MenuPageState extends State<MenuPage> {
     _chargerRelayPin = int.tryParse(
       prefs.getString(AppSettings.chargerRelayPinKey) ?? '26',
     );
+    _restoreSessionExpiryFromPrefs(prefs);
+    if (!widget.isOpenTime && _sessionExpiresAt != null) {
+      await prefs.setInt(
+        AppSettings.sessionExpiresAtKey,
+        _sessionExpiresAt!.millisecondsSinceEpoch,
+      );
+    }
     await _syncDeviceState();
+    if (!widget.isOpenTime) {
+      await _scheduleSessionMonitoring();
+    }
     _deviceStateTimer?.cancel();
     _deviceStateTimer = Timer.periodic(const Duration(seconds: 5), (_) {
       _syncDeviceState();
@@ -103,6 +130,8 @@ class _MenuPageState extends State<MenuPage> {
     if (deviceId == null || deviceId.isEmpty) {
       return;
     }
+
+    _refreshRemainingTimeFromClock();
 
     int? batteryLevel;
     try {
@@ -162,8 +191,10 @@ class _MenuPageState extends State<MenuPage> {
   }
 
   Future<void> _goToMainPage({bool scheduleReset = false}) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(AppSettings.sessionExpiresAtKey);
+
     if (scheduleReset) {
-      final prefs = await SharedPreferences.getInstance();
       final isDeepFreezeEnabled =
           prefs.getBool(AppSettings.deepFreezeEnabledKey) ?? false;
       if (isDeepFreezeEnabled) {
@@ -192,6 +223,11 @@ class _MenuPageState extends State<MenuPage> {
   }
 
   Future<void> _handleSessionExpired() async {
+    if (_sessionExpiredHandled) {
+      return;
+    }
+    _sessionExpiredHandled = true;
+
     if (widget.isOpenTime) {
       return;
     }
@@ -205,6 +241,7 @@ class _MenuPageState extends State<MenuPage> {
     }
 
     await _cancelSessionWarningNotification();
+    await _cancelSessionMonitoring();
     await _markDeviceOffline();
     await _goToMainPage(scheduleReset: true);
   }
@@ -217,15 +254,13 @@ class _MenuPageState extends State<MenuPage> {
         return;
       }
 
+      _refreshRemainingTimeFromClock();
+
       if (_remainingTime <= Duration.zero) {
         timer.cancel();
         _handleSessionExpired();
         return;
       }
-
-      setState(() {
-        _remainingTime -= const Duration(seconds: 1);
-      });
 
       _checkAndSendSessionWarnings();
 
@@ -235,23 +270,169 @@ class _MenuPageState extends State<MenuPage> {
     });
   }
 
+  int _calculateGridColumnCount(double maxWidth) {
+    const minTileWidth = 140.0;
+    final computedColumns = (maxWidth / minTileWidth).floor();
+    return math.max(2, math.min(computedColumns, 6));
+  }
+
   Future<void> _checkAndSendSessionWarnings() async {
     final secondsLeft = _remainingTime.inSeconds;
 
     if (!_sentOneMinuteWarning && secondsLeft <= _firstSessionWarningSeconds) {
       _sentOneMinuteWarning = true;
       await _showSessionWarningNotification(
-        title: 'Session ending soon',
-        body: 'Your session has less than 1 minute remaining.',
+        title: 'Less than 1 minute remaining',
+        body: 'Your session is almost over. Insert coins now if you want to continue.',
       );
     }
 
     if (!_sentTwentySecondWarning && secondsLeft <= _secondSessionWarningSeconds) {
       _sentTwentySecondWarning = true;
-      await _showSessionWarningNotification(
-        title: '20 seconds remaining',
-        body: 'Insert coins now if you want to continue your session.',
+      await _returnLauncherToFront();
+    }
+  }
+
+  Future<void> _scheduleSessionMonitoring() async {
+    if (widget.isOpenTime || _remainingTime <= Duration.zero) {
+      return;
+    }
+
+    final now = DateTime.now();
+    final expiresAt = _sessionExpiresAt ?? now.add(_remainingTime);
+    _sessionExpiresAt = expiresAt;
+    final warnOneMinuteAt = expiresAt.subtract(
+      const Duration(seconds: _firstSessionWarningSeconds),
+    );
+    final warnTwentySecondsAt = expiresAt.subtract(
+      const Duration(seconds: _secondSessionWarningSeconds),
+    );
+
+    try {
+      await _channel.invokeMethod<void>('scheduleSessionMonitoring', {
+        'expiresAtMs': expiresAt.millisecondsSinceEpoch,
+        'warnOneMinuteAtMs': warnOneMinuteAt.isAfter(now)
+            ? warnOneMinuteAt.millisecondsSinceEpoch
+            : null,
+        'warnTwentySecondsAtMs': warnTwentySecondsAt.isAfter(now)
+            ? warnTwentySecondsAt.millisecondsSinceEpoch
+            : null,
+      });
+    } on PlatformException {
+      // Best effort only.
+    }
+  }
+
+  Future<void> _cancelSessionMonitoring() async {
+    try {
+      await _channel.invokeMethod<void>('cancelSessionMonitoring');
+    } on PlatformException {
+      // Best effort only.
+    }
+  }
+
+  Future<void> _handleResumeChecks() async {
+    if (!mounted || widget.isOpenTime || _sessionExpiredHandled) {
+      return;
+    }
+
+    final prefs = await SharedPreferences.getInstance();
+    _restoreSessionExpiryFromPrefs(prefs);
+    _refreshRemainingTimeFromClock();
+    if (_remainingTime <= Duration.zero) {
+      await _handleSessionExpired();
+      return;
+    }
+
+    final didExpire =
+        prefs.getBool(AppSettings.sessionExpiredPendingKey) ?? false;
+    if (!didExpire) {
+      return;
+    }
+
+    await prefs.remove(AppSettings.sessionExpiredPendingKey);
+    if (!mounted) {
+      return;
+    }
+    await _handleSessionExpired();
+  }
+
+  void _refreshRemainingTimeFromClock() {
+    if (widget.isOpenTime) {
+      return;
+    }
+
+    final expiresAt = _sessionExpiresAt;
+    if (expiresAt == null) {
+      return;
+    }
+
+    final nextRemaining = expiresAt.difference(DateTime.now());
+    final normalized = nextRemaining.isNegative ? Duration.zero : nextRemaining;
+
+    if (!mounted) {
+      _remainingTime = normalized;
+      return;
+    }
+
+    if (_remainingTime != normalized) {
+      setState(() {
+        _remainingTime = normalized;
+      });
+    }
+  }
+
+  void _restoreSessionExpiryFromPrefs(SharedPreferences prefs) {
+    if (widget.isOpenTime) {
+      return;
+    }
+
+    final storedExpiryMillis = prefs.getInt(AppSettings.sessionExpiresAtKey);
+    final storedExpiry = storedExpiryMillis == null
+        ? null
+        : DateTime.fromMillisecondsSinceEpoch(storedExpiryMillis);
+
+    if (storedExpiry != null) {
+      final currentExpiry = _sessionExpiresAt;
+      final normalizedCurrent = currentExpiry?.difference(DateTime.now());
+      final shouldKeepCurrentExpiry =
+          currentExpiry != null &&
+          normalizedCurrent != null &&
+          !normalizedCurrent.isNegative &&
+          currentExpiry.isAfter(storedExpiry);
+
+      if (shouldKeepCurrentExpiry) {
+        _remainingTime = normalizedCurrent;
+        return;
+      }
+
+      _sessionExpiresAt = storedExpiry;
+      final normalized = storedExpiry.difference(DateTime.now());
+      _remainingTime = normalized.isNegative ? Duration.zero : normalized;
+      return;
+    }
+
+    if (_sessionExpiresAt == null && _remainingTime > Duration.zero) {
+      _sessionExpiresAt = DateTime.now().add(_remainingTime);
+    }
+  }
+
+  Future<void> _closeAndClearWhitelistedApps() async {
+    final prefs = await SharedPreferences.getInstance();
+    final packages =
+        prefs.getStringList(AppSettings.allowedAppsKey) ?? <String>[];
+
+    if (packages.isEmpty) {
+      return;
+    }
+
+    try {
+      await _channel.invokeMethod<void>(
+        'resetWhitelistedApps',
+        <String, dynamic>{'packageNames': packages},
       );
+    } on PlatformException {
+      // Best effort only.
     }
   }
 
@@ -281,6 +462,14 @@ class _MenuPageState extends State<MenuPage> {
       });
     } on PlatformException {
       // Best effort only. Session countdown continues even if notifications fail.
+    }
+  }
+
+  Future<void> _returnLauncherToFront() async {
+    try {
+      await _channel.invokeMethod<void>('returnLauncherToFront');
+    } on PlatformException {
+      // Best effort only.
     }
   }
 
@@ -340,9 +529,25 @@ class _MenuPageState extends State<MenuPage> {
   }
 
   Future<void> _launchWhitelistedApp(_WhitelistApp app) async {
+    if (_isFinalCountdownLocked) {
+      if (!mounted) {
+        return;
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'App launching is locked during the final 20 seconds.',
+          ),
+        ),
+      );
+      return;
+    }
+
     try {
       await _channel.invokeMethod<void>('launchApp', <String, dynamic>{
         'packageName': app.packageName,
+        'allowPlayStore': _currentCustomerRole == 'admin',
       });
     } on PlatformException catch (error) {
       if (!mounted) {
@@ -357,6 +562,9 @@ class _MenuPageState extends State<MenuPage> {
 
   Future<void> _openCoinSessionPage() async {
     await _cancelSessionWarningNotification();
+    await _cancelSessionMonitoring();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(AppSettings.sessionExpiresAtKey);
 
     final deviceId = await DeviceIdentityService.getOrCreateDeviceId();
     final sessionResult = await ApiService.startSessionWithRetry(
@@ -429,7 +637,9 @@ class _MenuPageState extends State<MenuPage> {
   Future<void> _saveAndEndSession(String username) async {
     await _saveCurrentTimeForAccount(username);
     await _cancelSessionWarningNotification();
+    await _cancelSessionMonitoring();
     await _markDeviceOffline();
+    await _closeAndClearWhitelistedApps();
     await CustomerAccountService.clearCurrentCustomer();
     await _goToMainPage(scheduleReset: true);
   }
@@ -459,6 +669,7 @@ class _MenuPageState extends State<MenuPage> {
       if (result.isAdmin) {
         await _cancelSessionWarningNotification();
         await _markDeviceOffline();
+        await _closeAndClearWhitelistedApps();
         await CustomerAccountService.clearCurrentCustomer();
         await _goToMainPage(scheduleReset: false);
         return;
@@ -479,7 +690,9 @@ class _MenuPageState extends State<MenuPage> {
   Future<void> _handleEndSessionPressed() async {
     if (widget.isOpenTime || _currentCustomerRole == 'admin') {
       await _cancelSessionWarningNotification();
+      await _cancelSessionMonitoring();
       await _markDeviceOffline();
+      await _closeAndClearWhitelistedApps();
       await CustomerAccountService.clearCurrentCustomer();
       await _goToMainPage(scheduleReset: false);
       return;
@@ -532,7 +745,9 @@ class _MenuPageState extends State<MenuPage> {
     }
 
     await _cancelSessionWarningNotification();
+    await _cancelSessionMonitoring();
     await _markDeviceOffline();
+    await _closeAndClearWhitelistedApps();
     await CustomerAccountService.clearCurrentCustomer();
     await _goToMainPage(scheduleReset: true);
   }
@@ -592,25 +807,27 @@ class _MenuPageState extends State<MenuPage> {
                     ],
                   ),
                   const SizedBox(height: 12),
+                  SizedBox(
+                    width: double.infinity,
+                    child: ElevatedButton(
+                      onPressed: _openCoinSessionPage,
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.tealAccent.shade400,
+                        foregroundColor: Colors.black,
+                        padding: const EdgeInsets.symmetric(vertical: 16),
+                      ),
+                      child: const Text('Open Coin Page'),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
                   _InfoCard(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        _InfoRow(
-                          label: 'Business Name',
-                          value: widget.businessName,
-                        ),
                         _InfoRow(label: 'Device Name', value: widget.deviceName),
                         _InfoRow(
                           label: 'Customer',
                           value: _currentCustomerUsername ?? 'Guest',
-                        ),
-                        _InfoRow(
-                          label: 'Status',
-                          value: _isConnected ? 'Connected' : 'Disconnected',
-                          valueColor: _isConnected
-                              ? Colors.greenAccent
-                              : Colors.redAccent,
                         ),
                         _InfoRow(
                           label: 'Remaining Time',
@@ -636,6 +853,17 @@ class _MenuPageState extends State<MenuPage> {
                               fontWeight: FontWeight.w700,
                             ),
                           ),
+                          if (_isFinalCountdownLocked) ...[
+                            const SizedBox(height: 8),
+                            const Text(
+                              'App launching is locked during the final 20 seconds.',
+                              style: TextStyle(
+                                color: Colors.amberAccent,
+                                fontSize: 12,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ],
                           const SizedBox(height: 12),
                           Expanded(
                             child: _whitelistedApps.isEmpty
@@ -645,64 +873,78 @@ class _MenuPageState extends State<MenuPage> {
                                       style: TextStyle(color: Colors.white70),
                                     ),
                                   )
-                                : GridView.builder(
-                                    itemCount: _whitelistedApps.length,
-                                    gridDelegate:
-                                        const SliverGridDelegateWithFixedCrossAxisCount(
-                                          crossAxisCount: 4,
+                                : LayoutBuilder(
+                                    builder: (context, constraints) {
+                                      final crossAxisCount = _calculateGridColumnCount(
+                                        constraints.maxWidth,
+                                      );
+                                      return GridView.builder(
+                                        itemCount: _whitelistedApps.length,
+                                        gridDelegate:
+                                            SliverGridDelegateWithFixedCrossAxisCount(
+                                          crossAxisCount: crossAxisCount,
                                           mainAxisSpacing: 10,
                                           crossAxisSpacing: 10,
-                                          childAspectRatio: 0.75,
+                                          childAspectRatio: 0.82,
                                         ),
-                                    itemBuilder: (context, index) {
-                                      final app = _whitelistedApps[index];
-                                      return InkWell(
-                                        onTap: () => _launchWhitelistedApp(app),
-                                        borderRadius: BorderRadius.circular(16),
-                                        child: Column(
-                                          mainAxisSize: MainAxisSize.min,
-                                          children: [
-                                            Container(
-                                              width: 52,
-                                              height: 52,
-                                              decoration: BoxDecoration(
-                                                shape: BoxShape.circle,
-                                                color: Colors.white.withValues(
-                                                  alpha: 0.08,
+                                        itemBuilder: (context, index) {
+                                          final app = _whitelistedApps[index];
+                                          final isLocked = _isFinalCountdownLocked;
+                                          return InkWell(
+                                            onTap: isLocked
+                                                ? null
+                                                : () => _launchWhitelistedApp(app),
+                                            borderRadius: BorderRadius.circular(16),
+                                            child: Column(
+                                              mainAxisSize: MainAxisSize.min,
+                                              children: [
+                                                Container(
+                                                  width: 52,
+                                                  height: 52,
+                                                  decoration: BoxDecoration(
+                                                    shape: BoxShape.circle,
+                                                    color: Colors.white.withValues(
+                                                      alpha: isLocked ? 0.04 : 0.08,
+                                                    ),
+                                                    border: Border.all(
+                                                      color: isLocked
+                                                          ? Colors.white10
+                                                          : Colors.white12,
+                                                    ),
+                                                  ),
+                                                  child: ClipOval(
+                                                    child: app.iconBytes != null
+                                                        ? Image.memory(
+                                                            app.iconBytes!,
+                                                            fit: BoxFit.contain,
+                                                            errorBuilder: (_, _, _) {
+                                                              return _fallbackIcon(app);
+                                                            },
+                                                          )
+                                                        : _fallbackIcon(app),
+                                                  ),
                                                 ),
-                                                border: Border.all(
-                                                  color: Colors.white12,
+                                                const SizedBox(height: 8),
+                                                SizedBox(
+                                                  width: 60,
+                                                  child: Text(
+                                                    app.appName,
+                                                    maxLines: 1,
+                                                    overflow: TextOverflow.ellipsis,
+                                                    textAlign: TextAlign.center,
+                                                    style: TextStyle(
+                                                      color: isLocked
+                                                          ? Colors.white54
+                                                          : Colors.white,
+                                                      fontSize: 11,
+                                                      fontWeight: FontWeight.w600,
+                                                    ),
+                                                  ),
                                                 ),
-                                              ),
-                                              child: ClipOval(
-                                                child: app.iconBytes != null
-                                                    ? Image.memory(
-                                                        app.iconBytes!,
-                                                        fit: BoxFit.contain,
-                                                        errorBuilder: (_, _, _) {
-                                                          return _fallbackIcon(app);
-                                                        },
-                                                      )
-                                                    : _fallbackIcon(app),
-                                              ),
+                                              ],
                                             ),
-                                            const SizedBox(height: 8),
-                                            SizedBox(
-                                              width: 60,
-                                              child: Text(
-                                                app.appName,
-                                                maxLines: 1,
-                                                overflow: TextOverflow.ellipsis,
-                                                textAlign: TextAlign.center,
-                                                style: const TextStyle(
-                                                  color: Colors.white,
-                                                  fontSize: 11,
-                                                  fontWeight: FontWeight.w600,
-                                                ),
-                                              ),
-                                            ),
-                                          ],
-                                        ),
+                                          );
+                                        },
                                       );
                                     },
                                   ),
@@ -712,41 +954,6 @@ class _MenuPageState extends State<MenuPage> {
                     ),
                   ),
                   const SizedBox(height: 16),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: OutlinedButton(
-                          onPressed: () {
-                            Navigator.of(context).push(
-                              MaterialPageRoute(
-                                builder: (_) => const PasscodeScreen(),
-                              ),
-                            );
-                          },
-                          style: OutlinedButton.styleFrom(
-                            foregroundColor: Colors.white,
-                            side: BorderSide(
-                              color: Colors.white.withValues(alpha: 0.45),
-                            ),
-                            padding: const EdgeInsets.symmetric(vertical: 16),
-                          ),
-                          child: const Text('Admin Page'),
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: ElevatedButton(
-                          onPressed: _openCoinSessionPage,
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: Colors.tealAccent.shade400,
-                            foregroundColor: Colors.black,
-                            padding: const EdgeInsets.symmetric(vertical: 16),
-                          ),
-                          child: const Text('Open Coin Page'),
-                        ),
-                      ),
-                    ],
-                  ),
                 ],
               ),
             ),
@@ -951,6 +1158,19 @@ class _WhitelistApp {
       packageName: map['packageName'] as String? ?? '',
       iconBytes: map['icon'] is Uint8List ? map['icon'] as Uint8List : null,
     );
+  }
+}
+
+class _MenuLifecycleObserver with WidgetsBindingObserver {
+  _MenuLifecycleObserver({required this.onResumed});
+
+  final Future<void> Function() onResumed;
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      onResumed();
+    }
   }
 }
 

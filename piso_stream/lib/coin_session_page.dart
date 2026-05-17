@@ -429,15 +429,20 @@ class _CoinSessionPageState extends State<CoinSessionPage> {
       await CustomerAccountService.clearIdleDeadline();
     }
 
-    await _disposeKiosk(releaseSession: true);
+    try {
+      await ApiService.endSession(
+        kiosk.deviceId,
+        deviceName: widget.deviceName,
+      );
+    } catch (error) {
+      debugPrint('Confirm session during Start Playing failed: $error');
+    }
+
+    await _disposeKiosk(releaseSession: false);
 
     if (!mounted) return;
 
-    if (widget.fromMenuPage) {
-      _goToMenuPage();
-    } else {
-      _goToMenuPage();
-    }
+    _goToMenuPage();
   }
 
   @override
