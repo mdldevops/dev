@@ -437,7 +437,10 @@ class MainActivity : FlutterActivity() {
         try {
             setAllowedLockTaskPackages("com.android.settings")
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                dpm.setLockTaskFeatures(adminComponent, DevicePolicyManager.LOCK_TASK_FEATURE_NONE)
+                dpm.setLockTaskFeatures(
+                    adminComponent,
+                    DevicePolicyManager.LOCK_TASK_FEATURE_HOME
+                )
             }
 
             dpm.addPersistentPreferredActivity(
@@ -1005,7 +1008,10 @@ class MainActivity : FlutterActivity() {
         return try {
             dpm.setLockTaskPackages(adminComponent, arrayOf(packageName, "com.android.settings"))
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                dpm.setLockTaskFeatures(adminComponent, DevicePolicyManager.LOCK_TASK_FEATURE_NONE)
+                dpm.setLockTaskFeatures(
+                    adminComponent,
+                    DevicePolicyManager.LOCK_TASK_FEATURE_HOME
+                )
             }
             Log.d(logTag, "Revoked other packages from lock-task allowlist")
             true
