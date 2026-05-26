@@ -1,39 +1,34 @@
 #include <Arduino.h>
-#include <WiFi.h>
-#include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
-#include <esp_system.h>
-
-const char* ssid = "Loading...";
-const char* password = "MdlJcrZfrlZvrl11@2.4G";
-const char* wsHost = "portal.pisostream.online";
-const int wsPort = 443;
-const char* wsPath = "/charger";
-const bool wsSecure = true;
-
-const char* bootstrapLauncherDeviceName = "";
-String launcherDeviceId = "";
-String launcherDeviceName = bootstrapLauncherDeviceName;
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+#include <BLE2902.h>
 
 const int RELAY_1_PIN = 26;
 const int RELAY_2_PIN = 27;
 const int RELAY_3_PIN = 32;
 const int RELAY_4_PIN = 33;
 const bool relayOnLevel = HIGH;
-const unsigned long wifiReconnectIntervalMs = 10000;
-const unsigned long registerRefreshIntervalMs = 30000;
-const unsigned long websocketHeartbeatIntervalMs = 15000;
-const unsigned long websocketHeartbeatTimeoutMs = 3000;
-const uint8_t websocketHeartbeatDisconnectCount = 2;
+
+const char* bleBaseName = "PisoCharger";
+const char* serviceUuid = "91f05e01-0000-4f9c-bb88-5a9f6d770001";
+const char* commandCharacteristicUuid = "91f05e01-0000-4f9c-bb88-5a9f6d770002";
+const char* statusCharacteristicUuid = "91f05e01-0000-4f9c-bb88-5a9f6d770003";
 
 Preferences prefs;
-WebSocketsClient webSocket;
-String chargerDeviceId;
+BLEServer* bleServer = nullptr;
+BLECharacteristic* statusCharacteristic = nullptr;
+bool clientConnected = false;
 bool relayEnabled = false;
-unsigned long lastWifiReconnectAttemptMs = 0;
-unsigned long lastRegisterSentMs = 0;
 int lastRelayPin = RELAY_1_PIN;
+int startBelowPercent = 30;
+int stopAtPercent = 80;
+String chargerDeviceId;
+String bluetoothName;
+String launcherDeviceId = "";
+String launcherDeviceName = "";
 
 String buildChargerDeviceId() {
   uint64_t chipId = ESP.getEfuseMac();
@@ -48,6 +43,13 @@ String buildChargerDeviceId() {
   return String(buffer);
 }
 
+String buildBluetoothName() {
+  uint64_t chipId = ESP.getEfuseMac();
+  char suffix[16];
+  snprintf(suffix, sizeof(suffix), "%06X", static_cast<uint32_t>(chipId & 0xFFFFFF));
+  return String(bleBaseName) + "-" + String(suffix);
+}
+
 bool isKnownRelayPin(int relayPin) {
   return relayPin == RELAY_1_PIN ||
       relayPin == RELAY_2_PIN ||
@@ -55,33 +57,43 @@ bool isKnownRelayPin(int relayPin) {
       relayPin == RELAY_4_PIN;
 }
 
+void setAllRelaysLow() {
+  digitalWrite(RELAY_1_PIN, !relayOnLevel);
+  digitalWrite(RELAY_2_PIN, !relayOnLevel);
+  digitalWrite(RELAY_3_PIN, !relayOnLevel);
+  digitalWrite(RELAY_4_PIN, !relayOnLevel);
+}
+
 void setRelayState(int relayPin, bool enabled) {
   if (!isKnownRelayPin(relayPin)) {
-    Serial.println(String("[Charger] Unknown relay pin: ") + relayPin);
+    Serial.println(String("[Charger BLE] Unknown relay pin: ") + relayPin);
     return;
   }
 
+  setAllRelaysLow();
   relayEnabled = enabled;
   lastRelayPin = relayPin;
   digitalWrite(relayPin, enabled ? relayOnLevel : !relayOnLevel);
   Serial.println(
-    String("[Charger] Relay pin ") + relayPin + " " + (enabled ? "ON" : "OFF")
+    String("[Charger BLE] Relay pin ") + relayPin + " " + (enabled ? "ON" : "OFF")
   );
 }
 
-void setAllRelaysOff() {
-  setRelayState(RELAY_1_PIN, false);
-  setRelayState(RELAY_2_PIN, false);
-  setRelayState(RELAY_3_PIN, false);
-  setRelayState(RELAY_4_PIN, false);
-}
+void notifyStatus(const String& type, int batteryLevel, const String& reason) {
+  if (statusCharacteristic == nullptr) {
+    return;
+  }
 
-void sendChargerAck(bool enabled, int relayPin) {
   JsonDocument doc;
-  doc["type"] = "charger_ack";
+  doc["type"] = type;
   doc["device_id"] = chargerDeviceId;
-  doc["enabled"] = enabled;
-  doc["relay_pin"] = relayPin;
+  doc["bluetooth_name"] = bluetoothName;
+  doc["enabled"] = relayEnabled;
+  doc["relay_pin"] = lastRelayPin;
+  doc["start_below_percent"] = startBelowPercent;
+  doc["stop_at_percent"] = stopAtPercent;
+  doc["battery_level"] = batteryLevel;
+  doc["reason"] = reason;
   if (launcherDeviceId.length() > 0) {
     doc["launcher_device_id"] = launcherDeviceId;
   }
@@ -89,204 +101,151 @@ void sendChargerAck(bool enabled, int relayPin) {
     doc["launcher_device_name"] = launcherDeviceName;
   }
 
-  String output;
-  serializeJson(doc, output);
-  webSocket.sendTXT(output);
-  Serial.println("[Charger] Ack sent: " + output);
+  String payload;
+  serializeJson(doc, payload);
+  statusCharacteristic->setValue(payload.c_str());
+  statusCharacteristic->notify();
+  Serial.println("[Charger BLE] Notify: " + payload);
 }
 
-void loadBinding() {
-  const String savedLauncherId = prefs.getString("launcher_device_id", "");
-  if (savedLauncherId.length() > 0) {
-    launcherDeviceId = savedLauncherId;
+class ChargerServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) override {
+    clientConnected = true;
+    Serial.println("[Charger BLE] Launcher connected");
+    notifyStatus("charger_connected", -1, "ble_client_connected");
   }
 
-  const String savedLauncherName = prefs.getString("launcher_device_name", "");
-  if (savedLauncherName.length() > 0) {
-    launcherDeviceName = savedLauncherName;
+  void onDisconnect(BLEServer* pServer) override {
+    clientConnected = false;
+    Serial.println("[Charger BLE] Launcher disconnected");
+    BLEDevice::startAdvertising();
   }
-}
+};
 
-void registerToServer() {
-  JsonDocument doc;
-  doc["type"] = "register_charger";
-  doc["device_id"] = chargerDeviceId;
-  if (launcherDeviceId.length() > 0) {
-    doc["launcher_device_id"] = launcherDeviceId;
-  }
-  if (launcherDeviceName.length() > 0) {
-    doc["launcher_device_name"] = launcherDeviceName;
-  }
-
-  String output;
-  serializeJson(doc, output);
-  webSocket.sendTXT(output);
-  lastRegisterSentMs = millis();
-  Serial.println("[Charger] Registering: " + output);
-}
-
-void ensureWifiConnected() {
-  if (WiFi.status() == WL_CONNECTED) {
-    return;
-  }
-
-  const unsigned long now = millis();
-  if (now - lastWifiReconnectAttemptMs < wifiReconnectIntervalMs) {
-    return;
-  }
-
-  lastWifiReconnectAttemptMs = now;
-  Serial.println("[Charger] Wi-Fi disconnected. Reconnecting...");
-  WiFi.disconnect();
-  WiFi.begin(ssid, password);
-}
-
-void handleIncomingText(uint8_t* payload) {
-  JsonDocument doc;
-  const auto error = deserializeJson(doc, payload);
-  if (error) {
-    Serial.println(String("[Charger] Invalid JSON: ") + error.c_str());
-    return;
-  }
-
-  const String messageType = doc["type"] | "";
-  if (messageType == "register_ack") {
-    const String incomingLauncherId = String((const char*)(doc["launcher_device_id"] | ""));
-    const String incomingLauncherName = String((const char*)(doc["launcher_device_name"] | ""));
-
-    if (incomingLauncherId.length() > 0) {
-      launcherDeviceId = incomingLauncherId;
-      prefs.putString("launcher_device_id", launcherDeviceId);
+class ChargerCommandCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* characteristic) override {
+    const std::string value = characteristic->getValue();
+    if (value.empty()) {
+      return;
     }
 
-    if (incomingLauncherName.length() > 0) {
-      launcherDeviceName = incomingLauncherName;
+    JsonDocument doc;
+    const DeserializationError error = deserializeJson(doc, value);
+    if (error) {
+      Serial.println(String("[Charger BLE] Invalid JSON: ") + error.c_str());
+      notifyStatus("charger_error", -1, "invalid_json");
+      return;
+    }
+
+    const String type = doc["type"] | "";
+    launcherDeviceId = String((const char*)(doc["launcher_device_id"] | ""));
+    launcherDeviceName = String((const char*)(doc["launcher_device_name"] | ""));
+
+    if (launcherDeviceId.length() > 0) {
+      prefs.putString("launcher_device_id", launcherDeviceId);
+    }
+    if (launcherDeviceName.length() > 0) {
       prefs.putString("launcher_device_name", launcherDeviceName);
     }
 
-    Serial.println(
-      String("[Charger] Registered. launcher_device_id=") + launcherDeviceId +
-      String(", launcher_device_name=") + launcherDeviceName
-    );
-    return;
+    if (type == "charger_config") {
+      startBelowPercent = doc["start_below_percent"] | startBelowPercent;
+      stopAtPercent = doc["stop_at_percent"] | stopAtPercent;
+      const int relayPin = doc["relay_pin"] | lastRelayPin;
+      if (isKnownRelayPin(relayPin)) {
+        lastRelayPin = relayPin;
+      }
+
+      prefs.putInt("start_below_percent", startBelowPercent);
+      prefs.putInt("stop_at_percent", stopAtPercent);
+      prefs.putInt("relay_pin", lastRelayPin);
+
+      Serial.println(
+        String("[Charger BLE] Config updated: start=") + startBelowPercent +
+        String(", stop=") + stopAtPercent +
+        String(", relay_pin=") + lastRelayPin
+      );
+      notifyStatus("charger_config_ack", -1, "config_updated");
+      return;
+    }
+
+    if (type == "charger_command") {
+      const bool enabled = doc["enabled"] | false;
+      const int batteryLevel = doc["battery_level"] | -1;
+      const int relayPin = doc["relay_pin"] | lastRelayPin;
+      const String reason = doc["reason"] | "";
+
+      setRelayState(relayPin, enabled);
+      notifyStatus("charger_ack", batteryLevel, reason);
+      return;
+    }
+
+    if (type == "status_request") {
+      notifyStatus("charger_status", -1, "status_requested");
+      return;
+    }
   }
+};
 
-  if (messageType != "charger_command") {
-    return;
-  }
+void setupBle() {
+  BLEDevice::init(bluetoothName.c_str());
+  bleServer = BLEDevice::createServer();
+  bleServer->setCallbacks(new ChargerServerCallbacks());
 
-  const String incomingLauncherId = String((const char*)(doc["launcher_device_id"] | ""));
-  const String incomingLauncherName = String((const char*)(doc["launcher_device_name"] | ""));
+  BLEService* service = bleServer->createService(serviceUuid);
 
-  if (incomingLauncherId.length() > 0) {
-    launcherDeviceId = incomingLauncherId;
-    prefs.putString("launcher_device_id", launcherDeviceId);
-  }
-
-  if (incomingLauncherName.length() > 0) {
-    launcherDeviceName = incomingLauncherName;
-    prefs.putString("launcher_device_name", launcherDeviceName);
-  }
-
-  const bool enabled = doc["enabled"] | false;
-  const int batteryLevel = doc["battery_level"] | -1;
-  const int relayPin = doc["relay_pin"] | RELAY_1_PIN;
-  const String reason = String((const char*)(doc["reason"] | ""));
-
-  setRelayState(relayPin, enabled);
-  sendChargerAck(enabled, relayPin);
-  Serial.println(
-    String("[Charger] Command received. enabled=") + (enabled ? "true" : "false") +
-    String(", battery=") + batteryLevel +
-    String(", relay_pin=") + relayPin +
-    String(", reason=") + reason +
-    String(", launcher_device_name=") + launcherDeviceName
+  BLECharacteristic* commandCharacteristic = service->createCharacteristic(
+    commandCharacteristicUuid,
+    BLECharacteristic::PROPERTY_WRITE
   );
-}
+  commandCharacteristic->setCallbacks(new ChargerCommandCallbacks());
 
-void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
-  switch (type) {
-    case WStype_DISCONNECTED:
-      Serial.println("[Charger] Disconnected from server");
-      break;
-    case WStype_CONNECTED:
-      Serial.println("[Charger] Connected to server");
-      registerToServer();
-      break;
-    case WStype_ERROR:
-      Serial.println("[Charger] WebSocket error");
-      break;
-    case WStype_PING:
-      Serial.println("[Charger] Ping received");
-      break;
-    case WStype_PONG:
-      Serial.println("[Charger] Pong received");
-      break;
-    case WStype_TEXT:
-      handleIncomingText(payload);
-      break;
-    default:
-      break;
-  }
+  statusCharacteristic = service->createCharacteristic(
+    statusCharacteristicUuid,
+    BLECharacteristic::PROPERTY_READ |
+    BLECharacteristic::PROPERTY_NOTIFY
+  );
+  statusCharacteristic->addDescriptor(new BLE2902());
+
+  service->start();
+
+  BLEAdvertising* advertising = BLEDevice::getAdvertising();
+  advertising->addServiceUUID(serviceUuid);
+  advertising->setScanResponse(true);
+  advertising->setMinPreferred(0x06);
+  advertising->setMinPreferred(0x12);
+  BLEDevice::startAdvertising();
 }
 
 void setup() {
   Serial.begin(115200);
-  chargerDeviceId = buildChargerDeviceId();
+  prefs.begin("charger_ble", false);
 
-  prefs.begin("charger", false);
-  loadBinding();
+  chargerDeviceId = buildChargerDeviceId();
+  bluetoothName = prefs.getString("bluetooth_name", buildBluetoothName());
+  startBelowPercent = prefs.getInt("start_below_percent", 30);
+  stopAtPercent = prefs.getInt("stop_at_percent", 80);
+  lastRelayPin = prefs.getInt("relay_pin", RELAY_1_PIN);
+  launcherDeviceId = prefs.getString("launcher_device_id", "");
+  launcherDeviceName = prefs.getString("launcher_device_name", "");
 
   pinMode(RELAY_1_PIN, OUTPUT);
   pinMode(RELAY_2_PIN, OUTPUT);
   pinMode(RELAY_3_PIN, OUTPUT);
   pinMode(RELAY_4_PIN, OUTPUT);
-  setAllRelaysOff();
+  setAllRelaysLow();
 
-  Serial.println("[Charger] Device ID: " + chargerDeviceId);
-  Serial.println("[Charger] Launcher Device ID: " + launcherDeviceId);
-  Serial.println("[Charger] Launcher Device Name: " + launcherDeviceName);
-
-  Serial.printf("[Charger] Connecting to Wi-Fi %s", ssid);
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\n[Charger] Wi-Fi connected");
-  Serial.println("[Charger] Local IP: " + WiFi.localIP().toString());
+  Serial.println("[Charger BLE] Device ID: " + chargerDeviceId);
+  Serial.println("[Charger BLE] Bluetooth name: " + bluetoothName);
   Serial.println(
-    String("[Charger] WebSocket URL: ") +
-    (wsSecure ? "wss://" : "ws://") +
-    wsHost +
-    ":" +
-    wsPort +
-    wsPath
+    String("[Charger BLE] Thresholds start=") + startBelowPercent +
+    String(", stop=") + stopAtPercent +
+    String(", relay_pin=") + lastRelayPin
   );
 
-  if (wsSecure) {
-    webSocket.beginSSL(wsHost, wsPort, wsPath);
-  } else {
-    webSocket.begin(wsHost, wsPort, wsPath);
-  }
-  webSocket.onEvent(webSocketEvent);
-  webSocket.setReconnectInterval(5000);
-  webSocket.enableHeartbeat(
-    websocketHeartbeatIntervalMs,
-    websocketHeartbeatTimeoutMs,
-    websocketHeartbeatDisconnectCount
-  );
+  setupBle();
 }
 
 void loop() {
-  ensureWifiConnected();
-  webSocket.loop();
-
-  if (
-    WiFi.status() == WL_CONNECTED &&
-    webSocket.isConnected() &&
-    millis() - lastRegisterSentMs >= registerRefreshIntervalMs
-  ) {
-    registerToServer();
-  }
+  delay(50);
 }

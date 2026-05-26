@@ -66,6 +66,7 @@ class _CoinSessionPageState extends State<CoinSessionPage> {
   double _audioVolume = 1.0;
   bool _coinAudioEnabled = false;
   String? _coinAudioPath;
+  bool _isStandaloneMode = false;
 
   @override
   void initState() {
@@ -97,7 +98,7 @@ class _CoinSessionPageState extends State<CoinSessionPage> {
 
     _isClosing = true;
 
-    if (releaseSession) {
+    if (releaseSession && !_isStandaloneMode) {
       try {
         await ApiService.releaseSession(
           kiosk.deviceId,
@@ -117,6 +118,9 @@ class _CoinSessionPageState extends State<CoinSessionPage> {
 
   Future<void> _loadAudioSettings() async {
     final prefs = await SharedPreferences.getInstance();
+    _isStandaloneMode = AppSettings.isStandaloneModeValue(
+      prefs.getString(AppSettings.setupModeKey),
+    );
     final audioPath = prefs.getString(AppSettings.audioPathKey)?.trim();
 
     if (!mounted) {
@@ -127,7 +131,10 @@ class _CoinSessionPageState extends State<CoinSessionPage> {
       _audioEnabled = prefs.getBool(AppSettings.audioEnabledKey) ?? false;
       _audioPath = audioPath == null || audioPath.isEmpty ? null : audioPath;
       _audioLoop = prefs.getBool(AppSettings.audioLoopKey) ?? true;
-      _audioVolume = prefs.getDouble(AppSettings.audioVolumeKey) ?? 0.5;
+      _audioVolume =
+          prefs.getDouble(AppSettings.userAudioVolumeKey) ??
+          prefs.getDouble(AppSettings.audioVolumeKey) ??
+          0.5;
       _coinAudioEnabled =
           prefs.getBool(AppSettings.coinAudioEnabledKey) ?? false;
       final coinAudioPath = prefs
@@ -175,6 +182,10 @@ class _CoinSessionPageState extends State<CoinSessionPage> {
 
   Future<void> _initializeKiosk() async {
     try {
+      final prefs = await SharedPreferences.getInstance();
+      _isStandaloneMode = AppSettings.isStandaloneModeValue(
+        prefs.getString(AppSettings.setupModeKey),
+      );
       final deviceId = await DeviceIdentityService.getOrCreateDeviceId();
       kiosk = KioskController(
         deviceId: deviceId,
@@ -254,7 +265,12 @@ class _CoinSessionPageState extends State<CoinSessionPage> {
             _connectionError = false;
             _errorMessage = '';
             _diagnosticMessage = 'Session active. Coins are being monitored.';
+            return;
           }
+
+          _connectionError = true;
+          _errorMessage = error;
+          _diagnosticMessage = error;
         });
       };
 
@@ -429,13 +445,15 @@ class _CoinSessionPageState extends State<CoinSessionPage> {
       await CustomerAccountService.clearIdleDeadline();
     }
 
-    try {
-      await ApiService.endSession(
-        kiosk.deviceId,
-        deviceName: widget.deviceName,
-      );
-    } catch (error) {
-      debugPrint('Confirm session during Start Playing failed: $error');
+    if (!_isStandaloneMode) {
+      try {
+        await ApiService.endSession(
+          kiosk.deviceId,
+          deviceName: widget.deviceName,
+        );
+      } catch (error) {
+        debugPrint('Confirm session during Start Playing failed: $error');
+      }
     }
 
     await _disposeKiosk(releaseSession: false);

@@ -12,6 +12,8 @@ import 'customer_auth_page.dart';
 import 'device_status_bar.dart';
 import 'services/customer_account_service.dart';
 import 'services/device_identity_service.dart';
+import 'services/ble_charger_service.dart';
+import 'services/standalone_mqtt_service.dart';
 import 'services/socket_service.dart';
 import 'services/api_service.dart';
 import 'theme_provider.dart';
@@ -43,13 +45,26 @@ class _MyAppState extends State<MyApp> {
   @override
   void initState() {
     super.initState();
-    _initializeSharedSocket();
+    _initializeServices();
   }
 
   @override
   void dispose() {
     _sharedSocket?.removeBroadcastListener(_showBroadcastPopup);
     super.dispose();
+  }
+
+  Future<void> _initializeServices() async {
+    final prefs = await SharedPreferences.getInstance();
+    final setupMode = prefs.getString(AppSettings.setupModeKey);
+    if (AppSettings.isStandaloneModeValue(setupMode)) {
+      _sharedSocket?.removeBroadcastListener(_showBroadcastPopup);
+      _sharedSocket?.disconnect();
+      _sharedSocket = null;
+      return;
+    }
+
+    await _initializeSharedSocket();
   }
 
   Future<void> _initializeSharedSocket() async {
@@ -130,6 +145,7 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
 
   String _businessName = _defaultBusinessName;
   String _deviceName = _defaultDeviceName;
+  String _setupMode = AppSettings.setupModeServer;
   String? _portraitWallpaperPath;
   String? _landscapeWallpaperPath;
   String _gracePeriodLabel = AppSettings.defaultGracePeriodLabel;
@@ -146,6 +162,10 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
   Timer? _deviceLockTimer;
   Timer? _deviceStateTimer;
   String? _deviceId;
+  bool _isStartingCoinSession = false;
+
+  bool get _isStandaloneMode =>
+      AppSettings.isStandaloneModeValue(_setupMode);
 
   @override
   void initState() {
@@ -227,6 +247,9 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
     final savedLandscapeWallpaper = prefs
         .getString(AppSettings.landscapeWallpaperKey)
         ?.trim();
+    final setupMode =
+        prefs.getString(AppSettings.setupModeKey) ??
+        AppSettings.setupModeServer;
     final gracePeriodLabel =
         prefs.getString(AppSettings.gracePeriodKey) ??
         AppSettings.defaultGracePeriodLabel;
@@ -284,6 +307,7 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
       _businessName = (savedBusinessName == null || savedBusinessName.isEmpty)
           ? _defaultBusinessName
           : savedBusinessName;
+      _setupMode = setupMode;
       _deviceName = (savedDeviceName == null || savedDeviceName.isEmpty)
           ? _defaultDeviceName
           : savedDeviceName;
@@ -330,12 +354,27 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
 
     _startResetWatcher();
     await _startCustomerIdleTimer();
+    if (_isStandaloneMode) {
+      _deviceStateTimer?.cancel();
+      _deviceLockTimer?.cancel();
+      setState(() {
+        _isDeviceLocked = false;
+        _deviceLockMessage = 'Device is ready.';
+      });
+      return;
+    }
+
     await _refreshDeviceLockStatus();
     _startDeviceLockWatcher();
     _initializeDeviceStateSync();
   }
 
   Future<void> _initializeDeviceStateSync() async {
+    if (_isStandaloneMode) {
+      _deviceStateTimer?.cancel();
+      return;
+    }
+
     _deviceId ??= await DeviceIdentityService.getOrCreateDeviceId();
     await _syncDeviceState();
     _deviceStateTimer?.cancel();
@@ -356,6 +395,10 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
   }
 
   Future<void> _syncDeviceState() async {
+    if (_isStandaloneMode) {
+      return;
+    }
+
     final deviceId = _deviceId;
     if (deviceId == null || deviceId.isEmpty) {
       return;
@@ -374,6 +417,20 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
         ? expiresAt!.difference(DateTime.now()).inSeconds.clamp(0, 864000)
         : 0;
     final batteryLevel = await _getBatteryLevel();
+    final chargerStartPercent =
+        prefs.getInt(AppSettings.chargerStartPercentKey) ?? 30;
+    final chargerStopPercent =
+        prefs.getInt(AppSettings.chargerStopPercentKey) ?? 80;
+    if (batteryLevel != null) {
+      await BleChargerService.instance.syncChargingDecision(
+        batteryLevel: batteryLevel,
+        startBelowPercent: chargerStartPercent,
+        stopAtPercent: chargerStopPercent,
+        relayPin: _chargerRelayPin ?? 26,
+        launcherDeviceId: deviceId,
+        launcherDeviceName: _deviceName,
+      );
+    }
     await ApiService.updateDeviceState(
       deviceId: deviceId,
       status: 'online',
@@ -394,6 +451,10 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
   }
 
   Future<void> _refreshDeviceLockStatus() async {
+    if (_isStandaloneMode) {
+      return;
+    }
+
     final deviceId = await DeviceIdentityService.getOrCreateDeviceId();
     final status = await ApiService.getDeviceStatus(deviceId);
     if (!mounted || status == null) {
@@ -503,6 +564,17 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
   }
 
   Future<void> _startCoinSession(String? wallpaperPath) async {
+    if (_isStartingCoinSession) {
+      return;
+    }
+
+    if (mounted) {
+      setState(() {
+        _isStartingCoinSession = true;
+      });
+    }
+
+    try {
     if (_isDeviceLocked) {
       if (!mounted) {
         return;
@@ -514,51 +586,88 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
       return;
     }
 
-    final deviceId = await DeviceIdentityService.getOrCreateDeviceId();
-    final sessionResult = await ApiService.startSessionWithRetry(
-      deviceId,
-      _deviceName,
-    );
+    if (_isStandaloneMode) {
+      final launcherDeviceId = await DeviceIdentityService.getOrCreateDeviceId();
+      final controller = StandaloneMqttService.instance;
+      final connected = await controller.connectBySavedHost();
 
-    if (!mounted) {
-      return;
-    }
+      if (!mounted) {
+        return;
+      }
 
-    if (sessionResult == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Unable to contact the server right now.'),
-        ),
+      if (!connected) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Unable to connect to the standalone coin controller.',
+            ),
+          ),
+        );
+        return;
+      }
+
+      final openResult = await controller.openSession(
+        launcherDeviceId: launcherDeviceId,
+        launcherDeviceName: _deviceName,
       );
-      return;
-    }
 
-    final status = (sessionResult['status'] ?? '').toString();
-    if (status == 'locked') {
-      final message = (sessionResult['message'] ?? 'Device is locked.')
-          .toString();
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(message)));
-      return;
-    }
+      if (!mounted) {
+        return;
+      }
 
-    if (status == 'busy') {
-      final message =
-          (sessionResult['message'] ??
-                  'Another customer is currently inserting coins. Please try again in a moment.')
-              .toString();
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(message)));
-      return;
-    }
-
-    if (status != 'started') {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Unable to start coin session.')),
+      if (!openResult.allowed) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(openResult.message)));
+        return;
+      }
+    } else {
+      final deviceId = await DeviceIdentityService.getOrCreateDeviceId();
+      final sessionResult = await ApiService.startSessionWithRetry(
+        deviceId,
+        _deviceName,
       );
-      return;
+
+      if (!mounted) {
+        return;
+      }
+
+      if (sessionResult == null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Unable to contact the server right now.'),
+          ),
+        );
+        return;
+      }
+
+      final status = (sessionResult['status'] ?? '').toString();
+      if (status == 'locked') {
+        final message = (sessionResult['message'] ?? 'Device is locked.')
+            .toString();
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(message)));
+        return;
+      }
+
+      if (status == 'busy') {
+        final message =
+            (sessionResult['message'] ??
+                    'Another customer is currently inserting coins. Please try again in a moment.')
+                .toString();
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(message)));
+        return;
+      }
+
+      if (status != 'started') {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Unable to start coin session.')),
+        );
+        return;
+      }
     }
 
     _customerIdleTimer?.cancel();
@@ -576,6 +685,15 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
         ),
       ),
     );
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isStartingCoinSession = false;
+        });
+      } else {
+        _isStartingCoinSession = false;
+      }
+    }
   }
 
   Future<void> _startCustomerIdleTimer() async {
@@ -634,6 +752,10 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
   }
 
   Future<void> _handleCustomerAuth(CustomerAuthMode mode) async {
+    if (_isStandaloneMode && mode != CustomerAuthMode.login) {
+      return;
+    }
+
     final credentials = await showCustomerAuthPage(context, mode: mode);
     if (credentials == null) {
       return;
@@ -655,6 +777,20 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
         role: result.role,
       );
       await _refreshNativeKioskPolicies();
+
+      if (_isStandaloneMode && !result.isAdmin) {
+        await CustomerAccountService.clearCurrentCustomer();
+        if (!mounted) {
+          return;
+        }
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Only admin login is available in standalone mode.'),
+          ),
+        );
+        return;
+      }
 
       if (!mounted) {
         return;
@@ -731,7 +867,9 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            mode == CustomerAuthMode.login
+            _isStandaloneMode
+                ? 'Admin login successful.'
+                : mode == CustomerAuthMode.login
                 ? 'Logged in as ${result.username}.'
                 : 'Registered as ${result.username}.',
           ),
@@ -842,6 +980,15 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
                         ),
                       );
                     },
+                    showLoginAction: _isStandaloneMode,
+                    isAdminLoggedIn: _currentCustomerRole == 'admin',
+                    onLoginTap: () async {
+                      if (_currentCustomerRole == 'admin') {
+                        await _logoutCustomer(showMessage: false);
+                        return;
+                      }
+                      await _handleCustomerAuth(CustomerAuthMode.login);
+                    },
                   ),
                   const SizedBox(height: 16),
                   // PC Name/Title - Two Lines
@@ -890,23 +1037,28 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
                         ),
                       ),
                       const SizedBox(height: 16),
-                      _CustomerAccessBar(
-                        currentCustomerUsername: _currentCustomerUsername,
-                        onLogin: () =>
-                            _handleCustomerAuth(CustomerAuthMode.login),
-                        onRegister: () =>
-                            _handleCustomerAuth(CustomerAuthMode.register),
-                        onLogout: () => _logoutCustomer(showMessage: false),
-                      ),
+                      if (!_isStandaloneMode)
+                        _CustomerAccessBar(
+                          currentCustomerUsername: _currentCustomerUsername,
+                          onLogin: () =>
+                              _handleCustomerAuth(CustomerAuthMode.login),
+                          onRegister: () =>
+                              _handleCustomerAuth(CustomerAuthMode.register),
+                          onLogout: () => _logoutCustomer(showMessage: false),
+                        ),
                     ],
                   ),
                   const Spacer(),
                   _ArcadeHeadline(
-                    title: _isDeviceLocked ? 'DEVICE LOCKED' : 'INSERT COIN',
+                    title: _isDeviceLocked
+                        ? 'DEVICE LOCKED'
+                        : (_isStartingCoinSession ? 'OPENING COIN...' : 'INSERT COIN'),
                     subtitle: _isDeviceLocked
                         ? _deviceLockMessage
-                        : 'Insert coin to start playing',
-                    onTap: _isDeviceLocked
+                        : (_isStartingCoinSession
+                              ? 'Please wait while the coin controller is opening'
+                              : 'Insert coin to start playing'),
+                    onTap: _isDeviceLocked || _isStartingCoinSession
                         ? null
                         : () => _startCoinSession(wallpaperPath),
                   ),
@@ -925,14 +1077,32 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
 }
 
 class _TopStatusBar extends StatelessWidget {
-  const _TopStatusBar({required this.onAdminTap});
+  const _TopStatusBar({
+    required this.onAdminTap,
+    this.showLoginAction = false,
+    this.isAdminLoggedIn = false,
+    this.onLoginTap,
+  });
 
   final VoidCallback onAdminTap;
+  final bool showLoginAction;
+  final bool isAdminLoggedIn;
+  final VoidCallback? onLoginTap;
 
   @override
   Widget build(BuildContext context) {
     return DeviceStatusBar(
       trailingPrefix: [
+        if (showLoginAction)
+          IconButton(
+            icon: Icon(
+              isAdminLoggedIn ? Icons.logout : Icons.login,
+              color: isAdminLoggedIn ? Colors.orangeAccent : Colors.white70,
+              size: 20,
+            ),
+            onPressed: onLoginTap,
+          ),
+        if (showLoginAction) const SizedBox(width: 8),
         IconButton(
           icon: const Icon(
             Icons.admin_panel_settings,

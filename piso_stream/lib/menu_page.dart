@@ -12,6 +12,8 @@ import 'coin_session_page.dart';
 import 'customer_auth_page.dart';
 import 'main.dart';
 import 'services/api_service.dart';
+import 'services/standalone_mqtt_service.dart';
+import 'services/ble_charger_service.dart';
 import 'services/customer_account_service.dart';
 import 'services/device_identity_service.dart';
 import 'theme_provider.dart';
@@ -54,17 +56,23 @@ class _MenuPageState extends State<MenuPage> {
   List<_WhitelistApp> _whitelistedApps = const <_WhitelistApp>[];
   String? _currentCustomerUsername;
   String? _currentCustomerRole;
+  String _setupMode = AppSettings.setupModeServer;
   String? _deviceId;
   int? _chargerRelayPin;
   DateTime? _sessionExpiresAt;
   bool _sentOneMinuteWarning = false;
   bool _sentTwentySecondWarning = false;
   bool _sessionExpiredHandled = false;
+  bool _isHandlingEndSessionPrompt = false;
+  bool _isOpeningCoinPage = false;
 
   bool get _isFinalCountdownLocked =>
       !widget.isOpenTime &&
       _remainingTime > Duration.zero &&
       _remainingTime.inSeconds <= _secondSessionWarningSeconds;
+
+  bool get _isStandaloneMode =>
+      AppSettings.isStandaloneModeValue(_setupMode);
 
   @override
   void initState() {
@@ -103,8 +111,10 @@ class _MenuPageState extends State<MenuPage> {
   );
 
   Future<void> _initializeDeviceStateSync() async {
-    _deviceId = await DeviceIdentityService.getOrCreateDeviceId();
     final prefs = await SharedPreferences.getInstance();
+    _setupMode =
+        prefs.getString(AppSettings.setupModeKey) ??
+        AppSettings.setupModeServer;
     _chargerRelayPin = int.tryParse(
       prefs.getString(AppSettings.chargerRelayPinKey) ?? '26',
     );
@@ -115,17 +125,28 @@ class _MenuPageState extends State<MenuPage> {
         _sessionExpiresAt!.millisecondsSinceEpoch,
       );
     }
-    await _syncDeviceState();
+    if (_isStandaloneMode) {
+      _deviceStateTimer?.cancel();
+    } else {
+      _deviceId = await DeviceIdentityService.getOrCreateDeviceId();
+      await _syncDeviceState();
+    }
     if (!widget.isOpenTime) {
       await _scheduleSessionMonitoring();
     }
     _deviceStateTimer?.cancel();
-    _deviceStateTimer = Timer.periodic(const Duration(seconds: 5), (_) {
-      _syncDeviceState();
-    });
+    if (!_isStandaloneMode) {
+      _deviceStateTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+        _syncDeviceState();
+      });
+    }
   }
 
   Future<void> _syncDeviceState() async {
+    if (_isStandaloneMode) {
+      return;
+    }
+
     final deviceId = _deviceId;
     if (deviceId == null || deviceId.isEmpty) {
       return;
@@ -143,6 +164,22 @@ class _MenuPageState extends State<MenuPage> {
       batteryLevel = null;
     }
 
+    final prefs = await SharedPreferences.getInstance();
+    final chargerStartPercent =
+        prefs.getInt(AppSettings.chargerStartPercentKey) ?? 30;
+    final chargerStopPercent =
+        prefs.getInt(AppSettings.chargerStopPercentKey) ?? 80;
+    if (batteryLevel != null) {
+      await BleChargerService.instance.syncChargingDecision(
+        batteryLevel: batteryLevel,
+        startBelowPercent: chargerStartPercent,
+        stopAtPercent: chargerStopPercent,
+        relayPin: _chargerRelayPin ?? 26,
+        launcherDeviceId: deviceId,
+        launcherDeviceName: widget.deviceName,
+      );
+    }
+
     await ApiService.updateDeviceState(
       deviceId: deviceId,
       status: 'online',
@@ -156,6 +193,10 @@ class _MenuPageState extends State<MenuPage> {
   }
 
   Future<void> _markDeviceOffline() async {
+    if (_isStandaloneMode) {
+      return;
+    }
+
     final deviceId = _deviceId;
     if (deviceId == null || deviceId.isEmpty) {
       return;
@@ -561,70 +602,129 @@ class _MenuPageState extends State<MenuPage> {
   }
 
   Future<void> _openCoinSessionPage() async {
+    if (_isOpeningCoinPage) {
+      return;
+    }
+
+    if (mounted) {
+      setState(() {
+        _isOpeningCoinPage = true;
+      });
+    }
+
+    try {
     await _cancelSessionWarningNotification();
     await _cancelSessionMonitoring();
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(AppSettings.sessionExpiresAtKey);
 
-    final deviceId = await DeviceIdentityService.getOrCreateDeviceId();
-    final sessionResult = await ApiService.startSessionWithRetry(
-      deviceId,
-      widget.deviceName,
-    );
+    if (_isStandaloneMode) {
+      final launcherDeviceId = await DeviceIdentityService.getOrCreateDeviceId();
+      final controller = StandaloneMqttService.instance;
+      final connected = await controller.connectBySavedHost();
 
-    if (!mounted) {
-      return;
-    }
+      if (!mounted) {
+        return;
+      }
 
-    if (sessionResult == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Unable to contact the server right now.')),
+      if (!connected) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Unable to connect to the standalone coin controller.',
+            ),
+          ),
+        );
+        return;
+      }
+
+      final openResult = await controller.openSession(
+        launcherDeviceId: launcherDeviceId,
+        launcherDeviceName: widget.deviceName,
       );
-      return;
-    }
 
-    final status = (sessionResult['status'] ?? '').toString();
-    if (status == 'busy') {
-      final message =
-          (sessionResult['message'] ??
-                  'Another customer is currently inserting coins. Please try again in a moment.')
-              .toString();
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(message)));
-      return;
-    }
+      if (!mounted) {
+        return;
+      }
 
-    if (status == 'locked') {
-      final message = (sessionResult['message'] ?? 'Device is locked.')
-          .toString();
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(message)));
-      return;
-    }
-
-    if (status != 'started') {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Unable to start coin session.')),
+      if (!openResult.allowed) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(openResult.message)));
+        return;
+      }
+    } else {
+      final deviceId = await DeviceIdentityService.getOrCreateDeviceId();
+      final sessionResult = await ApiService.startSessionWithRetry(
+        deviceId,
+        widget.deviceName,
       );
-      return;
+
+      if (!mounted) {
+        return;
+      }
+
+      if (sessionResult == null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Unable to contact the server right now.'),
+          ),
+        );
+        return;
+      }
+
+      final status = (sessionResult['status'] ?? '').toString();
+      if (status == 'busy') {
+        final message =
+            (sessionResult['message'] ??
+                    'Another customer is currently inserting coins. Please try again in a moment.')
+                .toString();
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(message)));
+        return;
+      }
+
+      if (status == 'locked') {
+        final message = (sessionResult['message'] ?? 'Device is locked.')
+            .toString();
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(message)));
+        return;
+      }
+
+      if (status != 'started') {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Unable to start coin session.')),
+        );
+        return;
+      }
     }
 
-    await Navigator.of(context).pushReplacement(
-      MaterialPageRoute(
-        builder: (_) => CoinSessionPage(
-          businessName: widget.businessName,
-          deviceName: widget.deviceName,
-          wallpaperPath: widget.wallpaperPath,
-          initialSelectedTime: _remainingTime,
-          fromMenuPage: true,
-          sessionAlreadyStarted: true,
-          currentCustomerUsername: _currentCustomerUsername,
-          currentCustomerRole: _currentCustomerRole,
+      await Navigator.of(context).pushReplacement(
+        MaterialPageRoute(
+          builder: (_) => CoinSessionPage(
+            businessName: widget.businessName,
+            deviceName: widget.deviceName,
+            wallpaperPath: widget.wallpaperPath,
+            initialSelectedTime: _remainingTime,
+            fromMenuPage: true,
+            sessionAlreadyStarted: true,
+            currentCustomerUsername: _currentCustomerUsername,
+            currentCustomerRole: _currentCustomerRole,
+          ),
         ),
-      ),
-    );
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isOpeningCoinPage = false;
+        });
+      } else {
+        _isOpeningCoinPage = false;
+      }
+    }
   }
 
   Future<void> _saveCurrentTimeForAccount(String username) async {
@@ -644,7 +744,32 @@ class _MenuPageState extends State<MenuPage> {
     await _goToMainPage(scheduleReset: true);
   }
 
+  Future<void> _clearAndEndSession() async {
+    if (_currentCustomerUsername != null &&
+        _currentCustomerRole != 'admin' &&
+        !_isStandaloneMode) {
+      try {
+        await CustomerAccountService.clearSavedSession(_currentCustomerUsername!);
+      } catch (_) {
+        // Best effort only. The session still ends locally.
+      }
+    }
+
+    await _cancelSessionWarningNotification();
+    await _cancelSessionMonitoring();
+    if (!_isStandaloneMode) {
+      await _markDeviceOffline();
+    }
+    await _closeAndClearWhitelistedApps();
+    await CustomerAccountService.clearCurrentCustomer();
+    await _goToMainPage(scheduleReset: true);
+  }
+
   Future<void> _authenticateAndSaveBeforeExit(CustomerAuthMode mode) async {
+    if (_isStandaloneMode && mode != CustomerAuthMode.login) {
+      return;
+    }
+
     final credentials = await showCustomerAuthPage(context, mode: mode);
     if (credentials == null) {
       return;
@@ -665,6 +790,20 @@ class _MenuPageState extends State<MenuPage> {
         result.username,
         role: result.role,
       );
+
+      if (_isStandaloneMode && !result.isAdmin) {
+        await CustomerAccountService.clearCurrentCustomer();
+        if (!mounted) {
+          return;
+        }
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Only admin login is available in standalone mode.'),
+          ),
+        );
+        return;
+      }
 
       if (result.isAdmin) {
         await _cancelSessionWarningNotification();
@@ -688,23 +827,65 @@ class _MenuPageState extends State<MenuPage> {
   }
 
   Future<void> _handleEndSessionPressed() async {
+    if (_isHandlingEndSessionPrompt) {
+      return;
+    }
+
+    if (_isStandaloneMode) {
+      _isHandlingEndSessionPrompt = true;
+      final shouldEnd = await showDialog<bool>(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) {
+          return AlertDialog(
+            backgroundColor: const Color(0xFF121212),
+            title: const Text(
+              'End Session',
+              style: TextStyle(color: Colors.white),
+            ),
+            content: const Text(
+              'Are you sure you want to end this session?',
+              style: TextStyle(color: Colors.white70),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(context).pop(false),
+                child: const Text('No'),
+              ),
+              ElevatedButton(
+                onPressed: () => Navigator.of(context).pop(true),
+                child: const Text('Yes'),
+              ),
+            ],
+          );
+        },
+      );
+
+      await Future<void>.delayed(const Duration(milliseconds: 180));
+      await _returnLauncherToFront();
+      _isHandlingEndSessionPrompt = false;
+
+      if (shouldEnd != true) {
+        return;
+      }
+
+      await _clearAndEndSession();
+      return;
+    }
+
     if (widget.isOpenTime || _currentCustomerRole == 'admin') {
-      await _cancelSessionWarningNotification();
-      await _cancelSessionMonitoring();
-      await _markDeviceOffline();
-      await _closeAndClearWhitelistedApps();
-      await CustomerAccountService.clearCurrentCustomer();
-      await _goToMainPage(scheduleReset: false);
+      await _clearAndEndSession();
       return;
     }
 
     if (_currentCustomerUsername != null) {
-      await _saveAndEndSession(_currentCustomerUsername!);
+      await _clearAndEndSession();
       return;
     }
 
     final action = await showDialog<String>(
       context: context,
+      barrierDismissible: false,
       builder: (context) {
         return AlertDialog(
           backgroundColor: const Color(0xFF121212),
@@ -734,6 +915,9 @@ class _MenuPageState extends State<MenuPage> {
       },
     );
 
+    await Future<void>.delayed(const Duration(milliseconds: 180));
+    await _returnLauncherToFront();
+
     if (action == 'login') {
       await _authenticateAndSaveBeforeExit(CustomerAuthMode.login);
       return;
@@ -744,12 +928,7 @@ class _MenuPageState extends State<MenuPage> {
       return;
     }
 
-    await _cancelSessionWarningNotification();
-    await _cancelSessionMonitoring();
-    await _markDeviceOffline();
-    await _closeAndClearWhitelistedApps();
-    await CustomerAccountService.clearCurrentCustomer();
-    await _goToMainPage(scheduleReset: true);
+    await _clearAndEndSession();
   }
 
   String _formatSessionTime(Duration duration) {
@@ -810,13 +989,15 @@ class _MenuPageState extends State<MenuPage> {
                   SizedBox(
                     width: double.infinity,
                     child: ElevatedButton(
-                      onPressed: _openCoinSessionPage,
+                      onPressed: _isOpeningCoinPage ? null : _openCoinSessionPage,
                       style: ElevatedButton.styleFrom(
                         backgroundColor: Colors.tealAccent.shade400,
                         foregroundColor: Colors.black,
                         padding: const EdgeInsets.symmetric(vertical: 16),
                       ),
-                      child: const Text('Open Coin Page'),
+                      child: Text(
+                        _isOpeningCoinPage ? 'Opening Coin Page...' : 'Open Coin Page',
+                      ),
                     ),
                   ),
                   const SizedBox(height: 12),
@@ -827,7 +1008,9 @@ class _MenuPageState extends State<MenuPage> {
                         _InfoRow(label: 'Device Name', value: widget.deviceName),
                         _InfoRow(
                           label: 'Customer',
-                          value: _currentCustomerUsername ?? 'Guest',
+                          value: _isStandaloneMode
+                              ? (_currentCustomerUsername ?? 'Walk-in')
+                              : (_currentCustomerUsername ?? 'Guest'),
                         ),
                         _InfoRow(
                           label: 'Remaining Time',

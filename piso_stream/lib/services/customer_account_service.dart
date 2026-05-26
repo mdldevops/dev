@@ -124,6 +124,10 @@ class CustomerAccountService {
     }
   }
 
+  static Future<void> clearSavedSession(String username) async {
+    await saveSession(username: username, remainingSeconds: 0);
+  }
+
   static Future<String?> getCurrentCustomer() async {
     final prefs = await SharedPreferences.getInstance();
     final value = prefs.getString(AppSettings.currentCustomerKey)?.trim();

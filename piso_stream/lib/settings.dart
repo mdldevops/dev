@@ -9,9 +9,11 @@ import 'app_settings.dart';
 import 'allowed_apps_page.dart';
 import 'kiosk_provisioning_page.dart';
 import 'services/admin_pin_service.dart';
-import 'services/api_service.dart';
 import 'services/audio_service.dart';
+import 'services/ble_charger_service.dart';
 import 'services/device_identity_service.dart';
+import 'services/local_db_service.dart';
+import 'services/standalone_mqtt_service.dart';
 import 'theme_provider.dart';
 
 class SettingsPage extends StatefulWidget {
@@ -28,10 +30,35 @@ class _SettingsPageState extends State<SettingsPage> {
 
   // State for toggles and values
   bool isDeepFreezeEnabled = false;
+  String _setupMode = AppSettings.setupModeServer;
   String gracePeriod = AppSettings.defaultGracePeriodLabel;
   final TextEditingController _businessNameController = TextEditingController();
   final TextEditingController _deviceNameController = TextEditingController();
+  final TextEditingController _chargerBleNameController = TextEditingController(
+    text: AppSettings.defaultChargerBleNamePrefix,
+  );
+  final TextEditingController _standaloneControllerIpController =
+      TextEditingController(
+        text: AppSettings.defaultStandaloneControllerIp,
+      );
+  final TextEditingController _onePesoMinutesController =
+      TextEditingController(
+    text: '6',
+  );
+  final TextEditingController _fivePesoMinutesController =
+      TextEditingController(
+    text: '30',
+  );
+  final TextEditingController _tenPesoMinutesController =
+      TextEditingController(
+    text: '60',
+  );
+  final TextEditingController _twentyPesoMinutesController =
+      TextEditingController(
+    text: '120',
+  );
   double _volume = 0.5;
+  double _userVolume = 0.5;
   bool _audioEnabled = false;
   bool _audioLoop = true;
   bool _allowAppUpdates = false;
@@ -52,6 +79,25 @@ class _SettingsPageState extends State<SettingsPage> {
   String? _activeSessionCustomer;
   String? _activeSessionRole;
   Duration? _activeSessionRemaining;
+  StandaloneSalesSummary _standaloneSalesSummary = const StandaloneSalesSummary(
+    total: 0,
+    daily: 0,
+    weekly: 0,
+    monthly: 0,
+  );
+  bool get _isStandaloneMode =>
+      AppSettings.isStandaloneModeValue(_setupMode);
+  bool _isBleConnecting = false;
+  bool _isBleScanning = false;
+  String _chargerBleStatus = 'Not connected';
+  List<BleChargerScanResult> _chargerScanResults =
+      const <BleChargerScanResult>[];
+  StreamSubscription<List<BleChargerScanResult>>? _chargerScanSubscription;
+  StreamSubscription<String>? _chargerStatusSubscription;
+  bool _isCheckingCoinController = false;
+  String _coinControllerStatus = 'Not checked';
+  StreamSubscription<Map<String, dynamic>>?
+      _coinControllerMessageSubscription;
   final TextEditingController _chargeStartController = TextEditingController(
     text: '30',
   );
@@ -63,13 +109,13 @@ class _SettingsPageState extends State<SettingsPage> {
   @override
   void initState() {
     super.initState();
+    _bindBleStatus();
     _loadSavedSettings();
     _loadDeviceOwnerStatus();
     _loadActiveSessionState();
     _startActiveSessionWatcher();
   }
 
-  @override
   Future<void> _loadSavedSettings() async {
     final prefs = await SharedPreferences.getInstance();
 
@@ -80,8 +126,17 @@ class _SettingsPageState extends State<SettingsPage> {
     setState(() {
       _businessNameController.text =
           prefs.getString(AppSettings.businessNameKey) ?? '';
+      _setupMode =
+          prefs.getString(AppSettings.setupModeKey) ??
+          AppSettings.setupModeServer;
       _deviceNameController.text =
           prefs.getString(AppSettings.deviceNameKey) ?? '';
+      _chargerBleNameController.text =
+          prefs.getString(AppSettings.chargerBleDeviceNameKey) ??
+          AppSettings.defaultChargerBleNamePrefix;
+      _standaloneControllerIpController.text =
+          prefs.getString(AppSettings.standaloneControllerIpKey) ??
+          AppSettings.defaultStandaloneControllerIp;
       _portraitWallpaperPath = _normalizeWallpaperPath(
         prefs.getString(AppSettings.portraitWallpaperKey),
       );
@@ -95,6 +150,10 @@ class _SettingsPageState extends State<SettingsPage> {
       _audioEnabled = prefs.getBool(AppSettings.audioEnabledKey) ?? false;
       _audioLoop = prefs.getBool(AppSettings.audioLoopKey) ?? true;
       _volume = prefs.getDouble(AppSettings.audioVolumeKey) ?? 0.5;
+      _userVolume =
+          prefs.getDouble(AppSettings.userAudioVolumeKey) ??
+          prefs.getDouble(AppSettings.audioVolumeKey) ??
+          0.5;
       _audioPath = _normalizeWallpaperPath(
         prefs.getString(AppSettings.audioPathKey),
       );
@@ -112,27 +171,31 @@ class _SettingsPageState extends State<SettingsPage> {
       );
       _chargerRelayPin =
           prefs.getString(AppSettings.chargerRelayPinKey) ?? '26';
+      _chargeStartController.text =
+          (prefs.getInt(AppSettings.chargerStartPercentKey) ?? 30).toString();
+      _chargeStopController.text =
+          (prefs.getInt(AppSettings.chargerStopPercentKey) ?? 80).toString();
       gracePeriod =
           prefs.getString(AppSettings.gracePeriodKey) ??
           AppSettings.defaultGracePeriodLabel;
     });
 
-    final chargingConfig = await ApiService.getChargingConfig();
-    if (!mounted || chargingConfig == null) {
-      return;
-    }
+    final localConfig = await LocalDbService.instance.getStandaloneCoinConfig();
+    final localSales = await LocalDbService.instance.getStandaloneSalesSummary();
 
-    final settings = chargingConfig['settings'] as Map<String, dynamic>?;
-    if (settings == null) {
+    if (!mounted) {
       return;
     }
 
     setState(() {
-      _chargeStartController.text =
-          ((settings['startBelowPercent'] as num?)?.toInt() ?? 30).toString();
-      _chargeStopController.text =
-          ((settings['stopAtPercent'] as num?)?.toInt() ?? 80).toString();
+      _onePesoMinutesController.text = localConfig.onePesoMinutes.toString();
+      _fivePesoMinutesController.text = localConfig.fivePesoMinutes.toString();
+      _tenPesoMinutesController.text = localConfig.tenPesoMinutes.toString();
+      _twentyPesoMinutesController.text = localConfig.twentyPesoMinutes
+          .toString();
+      _standaloneSalesSummary = localSales;
     });
+
   }
 
   Future<void> _loadDeviceOwnerStatus() async {
@@ -157,6 +220,46 @@ class _SettingsPageState extends State<SettingsPage> {
         _isDeviceOwnerActive = false;
       });
     }
+  }
+
+  void _bindBleStatus() {
+    _chargerScanSubscription = BleChargerService.instance.scanResults.listen((
+      results,
+    ) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _chargerScanResults = results;
+      });
+    });
+
+    _chargerStatusSubscription = BleChargerService.instance.statusMessages.listen((
+      message,
+    ) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _chargerBleStatus = message;
+        _isBleConnecting = false;
+        _isBleScanning = false;
+      });
+    });
+
+    _coinControllerMessageSubscription = StandaloneMqttService.instance
+        .messages
+        .listen((message) {
+          if (!mounted) {
+            return;
+          }
+          setState(() {
+            _isCheckingCoinController = false;
+            _coinControllerStatus =
+                (message['message'] ?? message['type'] ?? 'Coin controller update')
+                    .toString();
+          });
+        });
   }
 
   void _startActiveSessionWatcher() {
@@ -344,9 +447,20 @@ class _SettingsPageState extends State<SettingsPage> {
       AppSettings.businessNameKey,
       _businessNameController.text.trim(),
     );
+    await prefs.setString(AppSettings.setupModeKey, _setupMode);
+    await prefs.setString(
+      AppSettings.standaloneControllerIpKey,
+      _standaloneControllerIpController.text.trim().isEmpty
+          ? AppSettings.defaultStandaloneControllerIp
+          : _standaloneControllerIpController.text.trim(),
+    );
     await prefs.setString(
       AppSettings.deviceNameKey,
       _deviceNameController.text.trim(),
+    );
+    await prefs.setString(
+      AppSettings.chargerBleDeviceNameKey,
+      _chargerBleNameController.text.trim(),
     );
     await prefs.setString(
       AppSettings.portraitWallpaperKey,
@@ -364,6 +478,10 @@ class _SettingsPageState extends State<SettingsPage> {
     await prefs.setBool(AppSettings.audioEnabledKey, _audioEnabled);
     await prefs.setBool(AppSettings.audioLoopKey, _audioLoop);
     await prefs.setDouble(AppSettings.audioVolumeKey, _volume.clamp(0.0, 1.0));
+    await prefs.setDouble(
+      AppSettings.userAudioVolumeKey,
+      _userVolume.clamp(0.0, 1.0),
+    );
     await prefs.setString(AppSettings.audioPathKey, _audioPath ?? '');
     await prefs.setBool(AppSettings.coinAudioEnabledKey, _coinAudioEnabled);
     await prefs.setString(AppSettings.coinAudioPathKey, _coinAudioPath ?? '');
@@ -380,7 +498,24 @@ class _SettingsPageState extends State<SettingsPage> {
       _lowTimeAlertsSoundPath ?? '',
     );
     await prefs.setString(AppSettings.chargerRelayPinKey, _chargerRelayPin);
+    await prefs.setInt(
+      AppSettings.chargerStartPercentKey,
+      int.tryParse(_chargeStartController.text.trim()) ?? 30,
+    );
+    await prefs.setInt(
+      AppSettings.chargerStopPercentKey,
+      int.tryParse(_chargeStopController.text.trim()) ?? 80,
+    );
     await prefs.setString(AppSettings.gracePeriodKey, gracePeriod);
+    await AudioService().setVolume(_userVolume);
+    await LocalDbService.instance.saveStandaloneCoinConfig(
+      onePesoMinutes: int.tryParse(_onePesoMinutesController.text.trim()) ?? 6,
+      fivePesoMinutes:
+          int.tryParse(_fivePesoMinutesController.text.trim()) ?? 30,
+      tenPesoMinutes: int.tryParse(_tenPesoMinutesController.text.trim()) ?? 60,
+      twentyPesoMinutes:
+          int.tryParse(_twentyPesoMinutesController.text.trim()) ?? 120,
+    );
     if (!isDeepFreezeEnabled) {
       await prefs.remove(AppSettings.pendingResetAtKey);
     }
@@ -415,29 +550,15 @@ class _SettingsPageState extends State<SettingsPage> {
       return;
     }
 
-    final deviceId = await DeviceIdentityService.getOrCreateDeviceId();
-    int? batteryLevel;
-    try {
-      final result = await _platformChannel.invokeMapMethod<String, dynamic>(
-        'getSystemStatus',
-      );
-      batteryLevel = (result?['batteryLevel'] as num?)?.toInt();
-    } on PlatformException {
-      batteryLevel = null;
-    }
-
-    await ApiService.updateDeviceState(
-      deviceId: deviceId,
-      status: 'online',
-      remainingSeconds: 0,
-      isSessionActive: false,
-      batteryLevel: batteryLevel,
-      chargerRelayPin: int.tryParse(_chargerRelayPin) ?? 26,
-    );
-
-    final chargingSaved = await ApiService.updateChargingConfig(
+    final launcherDeviceId = await DeviceIdentityService.getOrCreateDeviceId();
+    final chargingSaved = await BleChargerService.instance.pushChargingConfig(
+      launcherDeviceId: launcherDeviceId,
+      launcherDeviceName: _deviceNameController.text.trim().isEmpty
+          ? 'Launcher'
+          : _deviceNameController.text.trim(),
       startBelowPercent: startBelowPercent,
       stopAtPercent: stopAtPercent,
+      relayPin: int.tryParse(_chargerRelayPin) ?? 26,
     );
 
     if (!mounted) {
@@ -450,8 +571,8 @@ class _SettingsPageState extends State<SettingsPage> {
       SnackBar(
         content: Text(
           chargingSaved
-              ? 'Settings saved.'
-              : 'Local settings saved, but charging settings could not reach the server.',
+              ? 'Settings saved and charger config sent over BLE.'
+              : 'Settings saved locally. Connect to the charger controller to push config.',
         ),
       ),
     );
@@ -516,6 +637,140 @@ class _SettingsPageState extends State<SettingsPage> {
         _landscapeWallpaperPath = null;
       }
     });
+  }
+
+  Future<void> _scanForChargers() async {
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _isBleScanning = true;
+      _chargerBleStatus = 'Scanning for BLE charger controllers...';
+      _chargerScanResults = const <BleChargerScanResult>[];
+    });
+    await BleChargerService.instance.startScan(
+      namePrefix: AppSettings.defaultChargerBleNamePrefix,
+    );
+  }
+
+  Future<void> _connectToSavedCharger() async {
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _isBleConnecting = true;
+      _chargerBleStatus = 'Connecting to charger controller...';
+    });
+    final connected = await BleChargerService.instance.connectByName(
+      _chargerBleNameController.text.trim(),
+    );
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _isBleConnecting = false;
+      if (connected) {
+        _chargerBleStatus =
+            'Connected to ${BleChargerService.instance.connectedDeviceName ?? _chargerBleNameController.text.trim()}.';
+      }
+    });
+  }
+
+  Future<void> _disconnectCharger() async {
+    await BleChargerService.instance.disconnect();
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _chargerBleStatus = 'Disconnected from charger controller.';
+    });
+  }
+
+  Future<void> _checkCoinControllerConnection() async {
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _isCheckingCoinController = true;
+      _coinControllerStatus = 'Checking coin controller...';
+    });
+
+    try {
+      final connected = await StandaloneMqttService.instance.connectByHost(
+        _standaloneControllerIpController.text.trim(),
+      );
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _coinControllerStatus = connected
+            ? 'Connected to coin controller at ${StandaloneMqttService.instance.connectedHost ?? _standaloneControllerIpController.text.trim()}'
+            : 'Unable to connect to the coin controller';
+      });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _coinControllerStatus = 'Connection failed: $error';
+      });
+    } finally {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _isCheckingCoinController = false;
+      });
+    }
+  }
+
+  Future<void> _resetStandaloneSales() async {
+    final shouldReset = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) {
+        return AlertDialog(
+          backgroundColor: const Color(0xFF121212),
+          title: const Text(
+            'Reset Standalone Sales',
+            style: TextStyle(color: Colors.white),
+          ),
+          content: const Text(
+            'This will clear the standalone total, daily, weekly, and monthly sales history on this device.',
+            style: TextStyle(color: Colors.white70),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('Reset'),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (shouldReset != true) {
+      return;
+    }
+
+    await LocalDbService.instance.resetStandaloneSales();
+    final refreshed = await LocalDbService.instance.getStandaloneSalesSummary();
+
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _standaloneSalesSummary = refreshed;
+    });
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Standalone sales reset.')),
+    );
   }
 
   Future<void> _pickAudioFile() async {
@@ -655,7 +910,7 @@ class _SettingsPageState extends State<SettingsPage> {
       await audioService.playAudio(
         audioPath: _audioPath!,
         loop: _audioLoop,
-        volume: _volume,
+        volume: _userVolume,
       );
 
       if (!mounted) {
@@ -702,7 +957,7 @@ class _SettingsPageState extends State<SettingsPage> {
     try {
       await audioService.playEffectAudio(
         audioPath: _coinAudioPath!,
-        volume: _volume,
+        volume: _userVolume,
       );
 
       if (!mounted) {
@@ -760,7 +1015,7 @@ class _SettingsPageState extends State<SettingsPage> {
     try {
       await audioService.playEffectAudio(
         audioPath: _lowTimeAlertsSoundPath!,
-        volume: _volume,
+        volume: _userVolume,
       );
 
       if (!mounted) {
@@ -926,6 +1181,15 @@ class _SettingsPageState extends State<SettingsPage> {
     AudioService().stopAudio();
     _businessNameController.dispose();
     _deviceNameController.dispose();
+    _chargerBleNameController.dispose();
+    _standaloneControllerIpController.dispose();
+    _onePesoMinutesController.dispose();
+    _fivePesoMinutesController.dispose();
+    _tenPesoMinutesController.dispose();
+    _twentyPesoMinutesController.dispose();
+    _chargerScanSubscription?.cancel();
+    _chargerStatusSubscription?.cancel();
+    _coinControllerMessageSubscription?.cancel();
     _chargeStartController.dispose();
     _chargeStopController.dispose();
     super.dispose();
@@ -985,16 +1249,262 @@ class _SettingsPageState extends State<SettingsPage> {
                       },
                     ),
                     ExpansionTile(
+                      leading: const Icon(Icons.router, color: Colors.cyanAccent),
+                      title: const Text(
+                        "Setup Mode",
+                        style: TextStyle(color: Colors.white),
+                      ),
+                      subtitle: Text(
+                        _isStandaloneMode
+                            ? "Launcher <-> coin_controller direct WebSocket"
+                            : "Launcher <-> Node.js <-> piso kiosk",
+                        style: const TextStyle(color: Colors.white70),
+                      ),
+                      children: [
+                        RadioListTile<String>(
+                          value: AppSettings.setupModeServer,
+                          groupValue: _setupMode,
+                          activeColor: Colors.tealAccent,
+                          title: const Text(
+                            'Server',
+                            style: TextStyle(color: Colors.white),
+                          ),
+                          subtitle: const Text(
+                            'Keep the current APP-NODEJS-PISOKIOSK flow.',
+                            style: TextStyle(color: Colors.white70),
+                          ),
+                          onChanged: (value) {
+                            if (value == null) {
+                              return;
+                            }
+                            setState(() {
+                              _setupMode = value;
+                            });
+                          },
+                        ),
+                        RadioListTile<String>(
+                          value: AppSettings.setupModeStandalone,
+                          groupValue: _setupMode,
+                          activeColor: Colors.tealAccent,
+                          title: const Text(
+                            'Standalone',
+                            style: TextStyle(color: Colors.white),
+                          ),
+                          subtitle: const Text(
+                            'Connect directly to coin_controller over WebSocket.',
+                            style: TextStyle(color: Colors.white70),
+                          ),
+                          onChanged: (value) {
+                            if (value == null) {
+                              return;
+                            }
+                            setState(() {
+                              _setupMode = value;
+                            });
+                          },
+                        ),
+                        if (_isStandaloneMode) ...[
+                          const ListTile(
+                            title: Text(
+                              'coin_controller direct socket',
+                              style: TextStyle(color: Colors.white),
+                            ),
+                            subtitle: Text(
+                              'Use the controller static IP for the standalone socket connection.',
+                              style: TextStyle(color: Colors.white70),
+                            ),
+                          ),
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+                            child: TextFormField(
+                              controller: _standaloneControllerIpController,
+                              style: const TextStyle(color: Colors.white),
+                              decoration: const InputDecoration(
+                                labelText: 'coin_controller IP',
+                                labelStyle: TextStyle(color: Colors.white70),
+                                helperText:
+                                    'Default: 192.168.1.3',
+                                helperStyle: TextStyle(color: Colors.white54),
+                              ),
+                            ),
+                          ),
+                          ListTile(
+                            leading: Icon(
+                              StandaloneMqttService.instance.isConnected
+                                  ? Icons.check_circle
+                                  : Icons.error_outline,
+                              color: StandaloneMqttService.instance.isConnected
+                                  ? Colors.greenAccent
+                                  : Colors.orangeAccent,
+                            ),
+                            title: const Text(
+                              'Coin Controller Status',
+                              style: TextStyle(color: Colors.white),
+                            ),
+                            subtitle: Text(
+                              _coinControllerStatus,
+                              style: const TextStyle(color: Colors.white70),
+                            ),
+                            trailing: Wrap(
+                              spacing: 8,
+                              children: [
+                                OutlinedButton(
+                                  onPressed: _isCheckingCoinController
+                                      ? null
+                                      : _checkCoinControllerConnection,
+                                  child: Text(
+                                    _isCheckingCoinController
+                                        ? 'Checking...'
+                                        : 'Check',
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+                            child: Column(
+                              children: [
+                                Row(
+                                  children: [
+                                    const Expanded(
+                                      child: Text(
+                                        '1 Peso',
+                                        style: TextStyle(color: Colors.white),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 12),
+                                    Expanded(
+                                      child: TextFormField(
+                                        controller: _onePesoMinutesController,
+                                        keyboardType: TextInputType.number,
+                                        style: const TextStyle(color: Colors.white),
+                                        decoration: const InputDecoration(
+                                          labelText: 'Minutes',
+                                          labelStyle: TextStyle(color: Colors.white70),
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                                const SizedBox(height: 12),
+                                Row(
+                                  children: [
+                                    const Expanded(
+                                      child: Text(
+                                        '5 Peso',
+                                        style: TextStyle(color: Colors.white),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 12),
+                                    Expanded(
+                                      child: TextFormField(
+                                        controller: _fivePesoMinutesController,
+                                        keyboardType: TextInputType.number,
+                                        style: const TextStyle(color: Colors.white),
+                                        decoration: const InputDecoration(
+                                          labelText: 'Minutes',
+                                          labelStyle: TextStyle(color: Colors.white70),
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                                const SizedBox(height: 12),
+                                Row(
+                                  children: [
+                                    const Expanded(
+                                      child: Text(
+                                        '10 Peso',
+                                        style: TextStyle(color: Colors.white),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 12),
+                                    Expanded(
+                                      child: TextFormField(
+                                        controller: _tenPesoMinutesController,
+                                        keyboardType: TextInputType.number,
+                                        style: const TextStyle(color: Colors.white),
+                                        decoration: const InputDecoration(
+                                          labelText: 'Minutes',
+                                          labelStyle: TextStyle(color: Colors.white70),
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                                const SizedBox(height: 12),
+                                Row(
+                                  children: [
+                                    const Expanded(
+                                      child: Text(
+                                        '20 Peso',
+                                        style: TextStyle(color: Colors.white),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 12),
+                                    Expanded(
+                                      child: TextFormField(
+                                        controller: _twentyPesoMinutesController,
+                                        keyboardType: TextInputType.number,
+                                        style: const TextStyle(color: Colors.white),
+                                        decoration: const InputDecoration(
+                                          labelText: 'Minutes',
+                                          labelStyle: TextStyle(color: Colors.white70),
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ],
+                            ),
+                          ),
+                          ListTile(
+                            title: const Text(
+                              'Standalone Sales',
+                              style: TextStyle(color: Colors.white),
+                            ),
+                            subtitle: Text(
+                              'Total: ${_standaloneSalesSummary.total}\nDaily: ${_standaloneSalesSummary.daily}\nWeekly: ${_standaloneSalesSummary.weekly}\nMonthly: ${_standaloneSalesSummary.monthly}',
+                              style: const TextStyle(color: Colors.white70),
+                            ),
+                            trailing: OutlinedButton(
+                              onPressed: _resetStandaloneSales,
+                              child: const Text('Reset'),
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                    ExpansionTile(
                       leading: const Icon(Icons.battery_charging_full, color: Colors.lightGreenAccent),
                       title: const Text(
                         "Charging Control",
                         style: TextStyle(color: Colors.white),
                       ),
-                      subtitle: const Text(
-                        "Server-controlled battery charging thresholds.",
-                        style: TextStyle(color: Colors.white70),
+                      subtitle: Text(
+                        _chargerBleStatus,
+                        style: TextStyle(
+                          color: BleChargerService.instance.isConnected
+                              ? Colors.greenAccent
+                              : Colors.white70,
+                        ),
                       ),
                       children: [
+                        Padding(
+                          padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+                          child: TextFormField(
+                            controller: _chargerBleNameController,
+                            style: const TextStyle(color: Colors.white),
+                            decoration: const InputDecoration(
+                              labelText: 'Charger BLE Name',
+                              labelStyle: TextStyle(color: Colors.white70),
+                              helperText:
+                                  'Use the unique advertised charger Bluetooth name.',
+                              helperStyle: TextStyle(color: Colors.white54),
+                            ),
+                          ),
+                        ),
                         Padding(
                           padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
                           child: TextFormField(
@@ -1019,6 +1529,80 @@ class _SettingsPageState extends State<SettingsPage> {
                             ),
                           ),
                         ),
+                        Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 16),
+                          child: Row(
+                            children: [
+                              Expanded(
+                                child: OutlinedButton(
+                                  onPressed: _isBleScanning ? null : _scanForChargers,
+                                  child: Text(
+                                    _isBleScanning ? 'Scanning...' : 'Scan',
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: OutlinedButton(
+                                  onPressed: _isBleConnecting
+                                      ? null
+                                      : _connectToSavedCharger,
+                                  child: Text(
+                                    _isBleConnecting ? 'Connecting...' : 'Connect',
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: OutlinedButton(
+                                  onPressed: BleChargerService.instance.isConnected
+                                      ? _disconnectCharger
+                                      : null,
+                                  child: const Text('Disconnect'),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        if (_chargerScanResults.isNotEmpty)
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(8, 12, 8, 8),
+                            child: Column(
+                              children: _chargerScanResults
+                                  .map(
+                                    (device) => ListTile(
+                                      dense: true,
+                                      leading: const Icon(
+                                        Icons.bluetooth,
+                                        color: Colors.cyanAccent,
+                                      ),
+                                      title: Text(
+                                        device.name,
+                                        style: const TextStyle(
+                                          color: Colors.white,
+                                        ),
+                                      ),
+                                      subtitle: Text(
+                                        'RSSI ${device.rssi} • ${device.remoteId}',
+                                        style: const TextStyle(
+                                          color: Colors.white70,
+                                        ),
+                                      ),
+                                      trailing: TextButton(
+                                        onPressed: () {
+                                          setState(() {
+                                            _chargerBleNameController.text =
+                                                device.name;
+                                          });
+                                          _connectToSavedCharger();
+                                        },
+                                        child: const Text('Use'),
+                                      ),
+                                    ),
+                                  )
+                                  .toList(),
+                            ),
+                          ),
                       ],
                     ),
                     ExpansionTile(
@@ -1361,6 +1945,35 @@ class _SettingsPageState extends State<SettingsPage> {
         Slider(
           value: _volume,
           onChanged: (val) => setState(() => _volume = val),
+        ),
+        const Padding(
+          padding: EdgeInsets.symmetric(horizontal: 16),
+          child: Align(
+            alignment: Alignment.centerLeft,
+            child: Text(
+              'Volume can only be changed here.',
+              style: TextStyle(
+                color: Colors.orangeAccent,
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(height: 8),
+        ListTile(
+          title: const Text(
+            'User Sound Volume',
+            style: TextStyle(color: Colors.white),
+          ),
+          subtitle: const Text(
+            'Saved playback volume for customer and walk-in sessions.',
+            style: TextStyle(color: Colors.white70),
+          ),
+        ),
+        Slider(
+          value: _userVolume,
+          onChanged: (val) => setState(() => _userVolume = val),
         ),
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 16),

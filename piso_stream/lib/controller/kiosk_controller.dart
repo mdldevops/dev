@@ -1,5 +1,10 @@
 import 'dart:async';
 
+import 'package:shared_preferences/shared_preferences.dart';
+
+import '../app_settings.dart';
+import 'package:piso_stream/services/standalone_mqtt_service.dart';
+import 'package:piso_stream/services/local_db_service.dart';
 import 'package:piso_stream/services/api_service.dart';
 import 'package:piso_stream/services/socket_service.dart';
 
@@ -9,6 +14,7 @@ class KioskController {
   final bool sessionAlreadyStarted;
 
   late SocketService socket;
+  StreamSubscription<MqttCoinEvent>? _standaloneCoinSubscription;
 
   int total = 0;
   int minutes = 0;
@@ -16,8 +22,11 @@ class KioskController {
   bool initialized = false;
   bool isActive = false;
   bool isConnected = false;
+  bool _isStandaloneMode = false;
   Timer? _sessionStatePoller;
+  Timer? _standaloneHeartbeatTimer;
   bool _isSyncingSessionState = false;
+  String? _lastStandaloneCoinEventId;
 
   Function(int total, int minutes)? onUpdate;
   Function()? onSessionStarted;
@@ -90,6 +99,15 @@ class KioskController {
   }
 
   Future<void> initialize() async {
+    final prefs = await SharedPreferences.getInstance();
+    final setupMode = prefs.getString(AppSettings.setupModeKey);
+    _isStandaloneMode = AppSettings.isStandaloneModeValue(setupMode);
+
+    if (_isStandaloneMode) {
+      await _initializeStandalone();
+      return;
+    }
+
     print("Initializing kiosk...");
 
     socket = SocketService(url: ApiService.socketUrl, deviceId: deviceId);
@@ -228,7 +246,119 @@ class KioskController {
     unawaited(_syncSessionState());
   }
 
+  Future<void> _initializeStandalone() async {
+    print("Initializing standalone direct-controller kiosk...");
+
+    final controller = StandaloneMqttService.instance;
+    _standaloneCoinSubscription?.cancel();
+    _standaloneCoinSubscription = controller.coinEvents.listen((event) async {
+      if (event.activeLauncherDeviceId != deviceId) {
+        return;
+      }
+
+      if (_lastStandaloneCoinEventId == event.eventId) {
+        await controller.acknowledgeCoinCredit(
+          launcherDeviceId: deviceId,
+          launcherDeviceName: deviceName,
+          eventId: event.eventId,
+        );
+        return;
+      }
+      _lastStandaloneCoinEventId = event.eventId;
+
+      final addedMinutes = await LocalDbService.instance.convertAmountToMinutes(
+        event.amount,
+      );
+      total += event.amount;
+      minutes += addedMinutes;
+
+      await LocalDbService.instance.recordStandaloneSale(
+        amount: event.amount,
+        minutesAdded: addedMinutes,
+      );
+
+      if (onUpdate != null && addedMinutes > 0) {
+        onUpdate!(total, addedMinutes);
+      }
+
+      await controller.acknowledgeCoinCredit(
+        launcherDeviceId: deviceId,
+        launcherDeviceName: deviceName,
+        eventId: event.eventId,
+      );
+    });
+
+    final connected = await controller.connectBySavedHost();
+    if (!connected) {
+      isConnected = false;
+      initialized = false;
+      if (onError != null) {
+        onError!(
+          'Unable to connect to the standalone coin controller.',
+        );
+      }
+      return;
+    }
+
+    if (sessionAlreadyStarted) {
+      isConnected = controller.isConnected;
+      isActive = true;
+      initialized = true;
+      _startStandaloneHeartbeat();
+
+      if (onConnected != null && isConnected) {
+        onConnected!();
+      }
+      if (onSessionStarted != null) {
+        onSessionStarted!();
+      }
+      return;
+    }
+
+    final openResult = await controller.openSession(
+      launcherDeviceId: deviceId,
+      launcherDeviceName: deviceName,
+    );
+
+    if (!openResult.allowed) {
+      isConnected = true;
+      initialized = false;
+      isActive = false;
+      if (onError != null) {
+        onError!(openResult.message);
+      }
+      return;
+    }
+
+    isConnected = controller.isConnected;
+    isActive = true;
+    initialized = true;
+    _startStandaloneHeartbeat();
+
+    if (onConnected != null && isConnected) {
+      onConnected!();
+    }
+    if (onSessionStarted != null) {
+      onSessionStarted!();
+    }
+  }
+
   Future<void> endSession() async {
+    if (_isStandaloneMode) {
+      _standaloneHeartbeatTimer?.cancel();
+      _standaloneHeartbeatTimer = null;
+      await StandaloneMqttService.instance.closeSession(
+        launcherDeviceId: deviceId,
+        launcherDeviceName: deviceName,
+      );
+      await _standaloneCoinSubscription?.cancel();
+      _standaloneCoinSubscription = null;
+      initialized = false;
+      isActive = false;
+      isConnected = false;
+      return;
+    }
+
     if (isActive) {
       await ApiService.endSession(deviceId, deviceName: deviceName);
     }
@@ -242,10 +372,46 @@ class KioskController {
   }
 
   void dispose() {
+    if (_isStandaloneMode) {
+      _standaloneHeartbeatTimer?.cancel();
+      _standaloneHeartbeatTimer = null;
+      unawaited(
+        StandaloneMqttService.instance.closeSession(
+          launcherDeviceId: deviceId,
+          launcherDeviceName: deviceName,
+        ),
+      );
+      _standaloneCoinSubscription?.cancel();
+      _standaloneCoinSubscription = null;
+      initialized = false;
+      isActive = false;
+      isConnected = false;
+      return;
+    }
+
     _sessionStatePoller?.cancel();
     socket.removeEventListener(_handleEvent);
     socket.removeConnectedListener(_handleConnected);
     socket.removeDisconnectedListener(_handleDisconnect);
     socket.removeErrorListener(_handleSocketError);
+    initialized = false;
+  }
+
+  void _startStandaloneHeartbeat() {
+    _standaloneHeartbeatTimer?.cancel();
+    _standaloneHeartbeatTimer = Timer.periodic(
+      const Duration(seconds: 20),
+      (_) {
+        if (!_isStandaloneMode || !isActive) {
+          return;
+        }
+        unawaited(
+          StandaloneMqttService.instance.ping(
+            launcherDeviceId: deviceId,
+            launcherDeviceName: deviceName,
+          ),
+        );
+      },
+    );
   }
 }

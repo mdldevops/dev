@@ -11,6 +11,7 @@ import android.content.ComponentName
 import android.content.Intent
 import android.content.IntentFilter
 import android.media.AudioAttributes
+import android.media.AudioManager
 import android.media.MediaPlayer
 import android.media.MediaMetadataRetriever
 import android.os.Handler
@@ -19,6 +20,7 @@ import android.os.Build
 import android.os.Looper
 import android.os.PowerManager
 import android.view.View
+import android.view.KeyEvent
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
@@ -70,9 +72,12 @@ class MainActivity : FlutterActivity() {
     private val flutterPrefsName = "FlutterSharedPreferences"
     private val currentCustomerRolePrefKey = "flutter.current_customer_role"
     private val sessionExpiresAtPrefKey = "flutter.session_expires_at"
+    private val audioVolumePrefKey = "flutter.audio_volume"
+    private val userAudioVolumePrefKey = "flutter.user_audio_volume"
     private val lastLaunchedAppKey = "last_launched_app_package"
     private val allowAppUpdatesKey = "allow_app_updates"
     private val youtubePackageName = "com.google.android.youtube"
+    private val playStorePackageName = "com.android.vending"
     private val finalCountdownLockSeconds = 20L
     private val homeShortcutWindowMs = 2000L
     private val audioFadeDurationMs = 500L
@@ -92,6 +97,9 @@ class MainActivity : FlutterActivity() {
     private val devicePolicyManager by lazy {
         getSystemService(DevicePolicyManager::class.java)
     }
+    private val audioManager by lazy {
+        getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -99,6 +107,7 @@ class MainActivity : FlutterActivity() {
         handleLaunchIntent(intent)
         createNotificationChannel()
         requestNotificationPermissionIfNeeded()
+        applySavedAudioVolumePreference()
         applyImmersiveMode()
     }
 
@@ -283,6 +292,7 @@ class MainActivity : FlutterActivity() {
     override fun onResume() {
         super.onResume()
         adoptDeviceRotationPreference()
+        applySavedAudioVolumePreference()
         applyImmersiveMode()
         if (isAdminWifiSessionActive) {
             isAdminWifiSessionActive = false
@@ -372,6 +382,18 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.keyCode == KeyEvent.KEYCODE_VOLUME_UP ||
+            event.keyCode == KeyEvent.KEYCODE_VOLUME_DOWN ||
+            event.keyCode == KeyEvent.KEYCODE_VOLUME_MUTE
+        ) {
+            applySavedAudioVolumePreference()
+            return true
+        }
+
+        return super.dispatchKeyEvent(event)
+    }
+
     override fun onDestroy() {
         releaseSessionWakeLock()
         stopAudio(immediate = true)
@@ -459,6 +481,7 @@ class MainActivity : FlutterActivity() {
             } else {
                 dpm.addUserRestriction(adminComponent, UserManager.DISALLOW_INSTALL_APPS)
             }
+            syncProtectedAppVisibility()
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                 dpm.addUserRestriction(adminComponent, "no_app_multiwindow")
             }
@@ -1095,6 +1118,7 @@ class MainActivity : FlutterActivity() {
         return try {
             stopAudio(immediate = true)
             targetAudioVolume = volume.coerceIn(0f, 1f)
+            applySystemMediaVolume(targetAudioVolume)
             mediaPlayer = MediaPlayer().apply {
                 setAudioAttributes(
                     AudioAttributes.Builder()
@@ -1146,6 +1170,7 @@ class MainActivity : FlutterActivity() {
     private fun playEffectAudio(audioPath: String, volume: Float): Boolean {
         return try {
             stopEffectAudio()
+            applySystemMediaVolume(volume.coerceIn(0f, 1f))
             effectMediaPlayer = MediaPlayer().apply {
                 setAudioAttributes(
                     AudioAttributes.Builder()
@@ -1206,7 +1231,52 @@ class MainActivity : FlutterActivity() {
 
     private fun setAudioVolume(volume: Float) {
         targetAudioVolume = volume.coerceIn(0f, 1f)
+        applySystemMediaVolume(targetAudioVolume)
         fadePlayerTo(targetAudioVolume)
+    }
+
+    private fun applySavedAudioVolumePreference() {
+        val prefs = getSharedPreferences(flutterPrefsName, Context.MODE_PRIVATE)
+        val rawValue = prefs.all[userAudioVolumePrefKey] ?: prefs.all[audioVolumePrefKey]
+        val savedVolume = when (rawValue) {
+            is Float -> rawValue
+            is Double -> rawValue.toFloat()
+            is Int -> rawValue.toFloat()
+            is Long -> java.lang.Double.longBitsToDouble(rawValue).toFloat()
+            is String -> rawValue.toFloatOrNull() ?: 0.5f
+            else -> 0.5f
+        }.coerceIn(0f, 1f)
+        targetAudioVolume = savedVolume
+        applySystemMediaVolume(savedVolume)
+        mediaPlayer?.let { player ->
+            try {
+                player.setVolume(savedVolume, savedVolume)
+            } catch (_: IllegalStateException) {
+            }
+        }
+        effectMediaPlayer?.let { player ->
+            try {
+                player.setVolume(savedVolume, savedVolume)
+            } catch (_: IllegalStateException) {
+            }
+        }
+    }
+
+    private fun applySystemMediaVolume(normalizedVolume: Float) {
+        val manager = audioManager ?: return
+        val maxVolume = manager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        if (maxVolume <= 0) {
+            return
+        }
+
+        val clamped = normalizedVolume.coerceIn(0f, 1f)
+        var targetVolume = (clamped * maxVolume)
+            .toInt()
+            .coerceIn(0, maxVolume)
+        if (clamped > 0f && targetVolume == 0) {
+            targetVolume = 1
+        }
+        manager.setStreamVolume(AudioManager.STREAM_MUSIC, targetVolume, 0)
     }
 
     private fun fadePlayerTo(targetVolume: Float) {
@@ -1344,6 +1414,7 @@ class MainActivity : FlutterActivity() {
         }
 
         return try {
+            applySavedAudioVolumePreference()
             enforceStatusBarLock()
             applyImmersiveMode()
             startActivity(launchIntent)
@@ -1527,6 +1598,26 @@ class MainActivity : FlutterActivity() {
 
     private fun shouldAllowAppInstalls(): Boolean {
         return isAppUpdatesAllowed() && isAdminSessionActive()
+    }
+
+    private fun shouldAllowPlayStoreAccess(): Boolean {
+        return isAdminSessionActive()
+    }
+
+    private fun syncProtectedAppVisibility() {
+        if (!isDeviceOwnerApp()) {
+            return
+        }
+
+        val dpm = devicePolicyManager ?: return
+        val shouldHidePlayStore = !shouldAllowPlayStoreAccess()
+
+        try {
+            dpm.setApplicationHidden(adminComponent, playStorePackageName, shouldHidePlayStore)
+            Log.d(logTag, "Play Store hidden=$shouldHidePlayStore")
+        } catch (error: Exception) {
+            Log.w(logTag, "Unable to update Play Store visibility", error)
+        }
     }
 
     private fun hasActiveSessionShortcutTarget(): Boolean {

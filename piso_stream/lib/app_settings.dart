@@ -1,6 +1,8 @@
 import 'package:shared_preferences/shared_preferences.dart';
 
 class AppSettings {
+  static const String setupModeKey = 'setup_mode';
+  static const String standaloneControllerIpKey = 'standalone_controller_ip';
   static const String businessNameKey = 'business_name';
   static const String deviceNameKey = 'device_name';
   static const String portraitWallpaperKey = 'portrait_wallpaper_path';
@@ -23,6 +25,7 @@ class AppSettings {
   static const String audioPathKey = 'audio_path';
   static const String audioLoopKey = 'audio_loop';
   static const String audioVolumeKey = 'audio_volume';
+  static const String userAudioVolumeKey = 'user_audio_volume';
   static const String coinAudioEnabledKey = 'coin_audio_enabled';
   static const String coinAudioPathKey = 'coin_audio_path';
   static const String lowTimeAlertsEnabledKey = 'low_time_alerts_enabled';
@@ -30,9 +33,20 @@ class AppSettings {
   static const String lowTimeAlertsVibrationEnabledKey =
       'low_time_alerts_vibration_enabled';
   static const String chargerRelayPinKey = 'charger_relay_pin';
+  static const String chargerBleDeviceNameKey = 'charger_ble_device_name';
+  static const String chargerStartPercentKey = 'charger_start_percent';
+  static const String chargerStopPercentKey = 'charger_stop_percent';
   static const String sessionExpiredPendingKey = 'session_expired_pending';
   static const String nativeCloseDebugKey = 'native_close_debug';
   static const String defaultGracePeriodLabel = '1 minute';
+  static const String defaultStandaloneControllerIp = '192.168.1.3';
+  static const String defaultChargerBleNamePrefix = 'PisoCharger';
+  static const String setupModeServer = 'server';
+  static const String setupModeStandalone = 'standalone';
+
+  static bool isStandaloneModeValue(String? value) {
+    return (value ?? '').trim().toLowerCase() == setupModeStandalone;
+  }
 
   static Duration gracePeriodFromLabel(String? label) {
     final match = RegExp(r'(\d+)').firstMatch(label ?? '');
