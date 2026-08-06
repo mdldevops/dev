@@ -8,11 +8,15 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'app_settings.dart';
 import 'allowed_apps_page.dart';
 import 'kiosk_provisioning_page.dart';
+import 'media_wallpaper_background.dart';
+import 'standalone_sales_page.dart';
 import 'services/admin_pin_service.dart';
 import 'services/audio_service.dart';
 import 'services/ble_charger_service.dart';
 import 'services/device_identity_service.dart';
 import 'services/local_db_service.dart';
+import 'services/shelly_charger_service.dart';
+import 'services/socket_service.dart';
 import 'services/standalone_mqtt_service.dart';
 import 'theme_provider.dart';
 
@@ -23,13 +27,15 @@ class SettingsPage extends StatefulWidget {
   State<SettingsPage> createState() => _SettingsPageState();
 }
 
-class _SettingsPageState extends State<SettingsPage> {
+class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver {
   static const MethodChannel _platformChannel = MethodChannel(
     'com.example.piso_stream/installed_apps',
   );
 
   // State for toggles and values
   bool isDeepFreezeEnabled = false;
+  bool _kioskModeEnabled = true;
+  bool _backgroundServicesEnabled = true;
   String _setupMode = AppSettings.setupModeServer;
   String gracePeriod = AppSettings.defaultGracePeriodLabel;
   final TextEditingController _businessNameController = TextEditingController();
@@ -37,6 +43,20 @@ class _SettingsPageState extends State<SettingsPage> {
   final TextEditingController _chargerBleNameController = TextEditingController(
     text: AppSettings.defaultChargerBleNamePrefix,
   );
+  final TextEditingController _shellyOnUrlController = TextEditingController(
+    text: AppSettings.defaultShellyOnUrl,
+  );
+  final TextEditingController _shellyOffUrlController = TextEditingController(
+    text: AppSettings.defaultShellyOffUrl,
+  );
+  final TextEditingController _shellyToggleUrlController =
+      TextEditingController(
+        text: AppSettings.defaultShellyToggleUrl,
+      );
+  final TextEditingController _shellyUsernameController =
+      TextEditingController();
+  final TextEditingController _shellyPasswordController =
+      TextEditingController();
   final TextEditingController _standaloneControllerIpController =
       TextEditingController(
         text: AppSettings.defaultStandaloneControllerIp,
@@ -79,27 +99,26 @@ class _SettingsPageState extends State<SettingsPage> {
   String? _activeSessionCustomer;
   String? _activeSessionRole;
   Duration? _activeSessionRemaining;
-  StandaloneSalesSummary _standaloneSalesSummary = const StandaloneSalesSummary(
-    total: 0,
-    daily: 0,
-    weekly: 0,
-    monthly: 0,
-  );
   bool get _isStandaloneMode =>
       AppSettings.isStandaloneModeValue(_setupMode);
   bool _isBleConnecting = false;
   bool _isBleScanning = false;
+  bool _chargingControlEnabled = true;
+  String _chargerControlMode = AppSettings.chargerControlModeBle;
   String _chargerBleStatus = 'Not connected';
+  bool _shellyUseToggle = false;
+  bool _shellyUseAuth = false;
   List<BleChargerScanResult> _chargerScanResults =
       const <BleChargerScanResult>[];
   StreamSubscription<List<BleChargerScanResult>>? _chargerScanSubscription;
   StreamSubscription<String>? _chargerStatusSubscription;
   bool _isCheckingCoinController = false;
   String _coinControllerStatus = 'Not checked';
+  bool _timeOverlayPermissionGranted = false;
   StreamSubscription<Map<String, dynamic>>?
       _coinControllerMessageSubscription;
   final TextEditingController _chargeStartController = TextEditingController(
-    text: '30',
+    text: '20',
   );
   final TextEditingController _chargeStopController = TextEditingController(
     text: '80',
@@ -109,11 +128,38 @@ class _SettingsPageState extends State<SettingsPage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _bindBleStatus();
     _loadSavedSettings();
     _loadDeviceOwnerStatus();
+    _loadTimeOverlayPermissionStatus();
     _loadActiveSessionState();
     _startActiveSessionWatcher();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _loadTimeOverlayPermissionStatus();
+      _refreshChargingMonitor();
+    }
+  }
+
+  Future<void> _refreshChargingMonitor() async {
+    try {
+      debugPrint('[ChargingMonitor][settings] requesting refresh');
+      final result = await _platformChannel.invokeMapMethod<String, dynamic>(
+        'refreshChargingMonitor',
+        {
+          'resetDecisionCache': false,
+        },
+      );
+      debugPrint(
+        '[ChargingMonitor][settings] result=${result ?? <String, dynamic>{}}',
+      );
+    } on PlatformException catch (error) {
+      debugPrint('[ChargingMonitor][settings] failed: ${error.message}');
+    }
   }
 
   Future<void> _loadSavedSettings() async {
@@ -134,6 +180,28 @@ class _SettingsPageState extends State<SettingsPage> {
       _chargerBleNameController.text =
           prefs.getString(AppSettings.chargerBleDeviceNameKey) ??
           AppSettings.defaultChargerBleNamePrefix;
+      _chargerControlMode =
+          prefs.getString(AppSettings.chargerControlModeKey) ??
+          AppSettings.chargerControlModeBle;
+      _chargingControlEnabled =
+          prefs.getBool(AppSettings.chargingControlEnabledKey) ?? true;
+      _shellyOnUrlController.text =
+          prefs.getString(AppSettings.shellyChargeOnUrlKey) ??
+          AppSettings.defaultShellyOnUrl;
+      _shellyOffUrlController.text =
+          prefs.getString(AppSettings.shellyChargeOffUrlKey) ??
+          AppSettings.defaultShellyOffUrl;
+      _shellyUseToggle =
+          prefs.getBool(AppSettings.shellyUseToggleKey) ?? false;
+      _shellyToggleUrlController.text =
+          prefs.getString(AppSettings.shellyToggleUrlKey) ??
+          AppSettings.defaultShellyToggleUrl;
+      _shellyUseAuth =
+          prefs.getBool(AppSettings.shellyUseAuthKey) ?? false;
+      _shellyUsernameController.text =
+          prefs.getString(AppSettings.shellyUsernameKey) ?? '';
+      _shellyPasswordController.text =
+          prefs.getString(AppSettings.shellyPasswordKey) ?? '';
       _standaloneControllerIpController.text =
           prefs.getString(AppSettings.standaloneControllerIpKey) ??
           AppSettings.defaultStandaloneControllerIp;
@@ -145,6 +213,10 @@ class _SettingsPageState extends State<SettingsPage> {
       );
       isDeepFreezeEnabled =
           prefs.getBool(AppSettings.deepFreezeEnabledKey) ?? false;
+      _kioskModeEnabled =
+          prefs.getBool(AppSettings.kioskModeEnabledKey) ?? true;
+      _backgroundServicesEnabled =
+          prefs.getBool(AppSettings.backgroundServicesEnabledKey) ?? true;
       _allowAppUpdates =
           prefs.getBool(AppSettings.allowAppUpdatesKey) ?? false;
       _audioEnabled = prefs.getBool(AppSettings.audioEnabledKey) ?? false;
@@ -172,7 +244,7 @@ class _SettingsPageState extends State<SettingsPage> {
       _chargerRelayPin =
           prefs.getString(AppSettings.chargerRelayPinKey) ?? '26';
       _chargeStartController.text =
-          (prefs.getInt(AppSettings.chargerStartPercentKey) ?? 30).toString();
+          (prefs.getInt(AppSettings.chargerStartPercentKey) ?? 20).toString();
       _chargeStopController.text =
           (prefs.getInt(AppSettings.chargerStopPercentKey) ?? 80).toString();
       gracePeriod =
@@ -181,7 +253,6 @@ class _SettingsPageState extends State<SettingsPage> {
     });
 
     final localConfig = await LocalDbService.instance.getStandaloneCoinConfig();
-    final localSales = await LocalDbService.instance.getStandaloneSalesSummary();
 
     if (!mounted) {
       return;
@@ -193,7 +264,6 @@ class _SettingsPageState extends State<SettingsPage> {
       _tenPesoMinutesController.text = localConfig.tenPesoMinutes.toString();
       _twentyPesoMinutesController.text = localConfig.twentyPesoMinutes
           .toString();
-      _standaloneSalesSummary = localSales;
     });
 
   }
@@ -219,6 +289,87 @@ class _SettingsPageState extends State<SettingsPage> {
       setState(() {
         _isDeviceOwnerActive = false;
       });
+    }
+  }
+
+  Future<void> _loadTimeOverlayPermissionStatus() async {
+    try {
+      final granted = await _platformChannel.invokeMethod<bool>(
+        'canDrawTimeOverlay',
+      );
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _timeOverlayPermissionGranted = granted ?? false;
+      });
+    } on PlatformException {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _timeOverlayPermissionGranted = false;
+      });
+    }
+  }
+
+  Future<int?> _getCurrentBatteryLevel() async {
+    try {
+      final result = await _platformChannel.invokeMapMethod<String, dynamic>(
+        'getSystemStatus',
+      );
+      return (result?['batteryLevel'] as num?)?.toInt();
+    } on PlatformException {
+      return null;
+    }
+  }
+
+  Future<void> _openTimeOverlayPermissionSettings() async {
+    try {
+      await _platformChannel.invokeMethod<void>(
+        'openTimeOverlayPermissionSettings',
+      );
+    } on PlatformException catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            error.message ?? 'Unable to open overlay permission settings.',
+          ),
+        ),
+      );
+    }
+  }
+
+  Future<void> _testTimeOverlay() async {
+    try {
+      await _platformChannel.invokeMethod<void>('testRemainingTimeOverlay');
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Overlay test started for 2 minutes.'),
+        ),
+      );
+    } on PlatformException catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            error.message ?? 'Unable to start time overlay test.',
+          ),
+        ),
+      );
     }
   }
 
@@ -400,9 +551,9 @@ class _SettingsPageState extends State<SettingsPage> {
     }
   }
 
-  Future<void> _restartApp() async {
+  Future<void> _powerOffDevice() async {
     try {
-      await _platformChannel.invokeMethod<void>('restartApp');
+      await _platformChannel.invokeMethod<void>('rebootDevice');
     } on PlatformException catch (error) {
       if (!mounted) {
         return;
@@ -410,7 +561,9 @@ class _SettingsPageState extends State<SettingsPage> {
 
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(error.message ?? 'Unable to restart the app right now.'),
+          content: Text(
+            error.message ?? 'Unable to power off the device right now.',
+          ),
         ),
       );
     }
@@ -443,11 +596,16 @@ class _SettingsPageState extends State<SettingsPage> {
 
   Future<void> _saveSettings() async {
     final prefs = await SharedPreferences.getInstance();
+    final previousBackgroundServicesEnabled =
+        prefs.getBool(AppSettings.backgroundServicesEnabledKey) ?? true;
     await prefs.setString(
       AppSettings.businessNameKey,
       _businessNameController.text.trim(),
     );
     await prefs.setString(AppSettings.setupModeKey, _setupMode);
+    if (_isStandaloneMode) {
+      SocketService.disconnectShared();
+    }
     await prefs.setString(
       AppSettings.standaloneControllerIpKey,
       _standaloneControllerIpController.text.trim().isEmpty
@@ -463,6 +621,42 @@ class _SettingsPageState extends State<SettingsPage> {
       _chargerBleNameController.text.trim(),
     );
     await prefs.setString(
+      AppSettings.chargerControlModeKey,
+      _chargerControlMode,
+    );
+    await prefs.setBool(
+      AppSettings.chargingControlEnabledKey,
+      _chargingControlEnabled,
+    );
+    await prefs.setString(
+      AppSettings.shellyChargeOnUrlKey,
+      _shellyOnUrlController.text.trim(),
+    );
+    await prefs.setString(
+      AppSettings.shellyChargeOffUrlKey,
+      _shellyOffUrlController.text.trim(),
+    );
+    await prefs.setBool(
+      AppSettings.shellyUseToggleKey,
+      _shellyUseToggle,
+    );
+    await prefs.setString(
+      AppSettings.shellyToggleUrlKey,
+      _shellyToggleUrlController.text.trim(),
+    );
+    await prefs.setBool(
+      AppSettings.shellyUseAuthKey,
+      _shellyUseAuth,
+    );
+    await prefs.setString(
+      AppSettings.shellyUsernameKey,
+      _shellyUsernameController.text.trim(),
+    );
+    await prefs.setString(
+      AppSettings.shellyPasswordKey,
+      _shellyPasswordController.text,
+    );
+    await prefs.setString(
       AppSettings.portraitWallpaperKey,
       _portraitWallpaperPath ?? '',
     );
@@ -473,6 +667,14 @@ class _SettingsPageState extends State<SettingsPage> {
     await prefs.setBool(
       AppSettings.deepFreezeEnabledKey,
       isDeepFreezeEnabled,
+    );
+    await prefs.setBool(
+      AppSettings.kioskModeEnabledKey,
+      _kioskModeEnabled,
+    );
+    await prefs.setBool(
+      AppSettings.backgroundServicesEnabledKey,
+      _backgroundServicesEnabled,
     );
     await prefs.setBool(AppSettings.allowAppUpdatesKey, _allowAppUpdates);
     await prefs.setBool(AppSettings.audioEnabledKey, _audioEnabled);
@@ -500,7 +702,7 @@ class _SettingsPageState extends State<SettingsPage> {
     await prefs.setString(AppSettings.chargerRelayPinKey, _chargerRelayPin);
     await prefs.setInt(
       AppSettings.chargerStartPercentKey,
-      int.tryParse(_chargeStartController.text.trim()) ?? 30,
+      int.tryParse(_chargeStartController.text.trim()) ?? 20,
     );
     await prefs.setInt(
       AppSettings.chargerStopPercentKey,
@@ -528,12 +730,15 @@ class _SettingsPageState extends State<SettingsPage> {
       }
     }
 
+    await _platformChannel.invokeMethod<void>('setKioskModeEnabled', {
+      'enabled': _kioskModeEnabled,
+    });
     await _platformChannel.invokeMethod<void>('setAppUpdatesAllowed', {
       'allowed': _allowAppUpdates,
     });
 
     final startBelowPercent =
-        int.tryParse(_chargeStartController.text.trim()) ?? 30;
+        int.tryParse(_chargeStartController.text.trim()) ?? 20;
     final stopAtPercent =
         int.tryParse(_chargeStopController.text.trim()) ?? 80;
 
@@ -550,38 +755,95 @@ class _SettingsPageState extends State<SettingsPage> {
       return;
     }
 
-    final launcherDeviceId = await DeviceIdentityService.getOrCreateDeviceId();
-    final chargingSaved = await BleChargerService.instance.pushChargingConfig(
-      launcherDeviceId: launcherDeviceId,
-      launcherDeviceName: _deviceNameController.text.trim().isEmpty
-          ? 'Launcher'
-          : _deviceNameController.text.trim(),
-      startBelowPercent: startBelowPercent,
-      stopAtPercent: stopAtPercent,
-      relayPin: int.tryParse(_chargerRelayPin) ?? 26,
-    );
+    bool chargingSaved = false;
+    if (!_chargingControlEnabled) {
+      BleChargerService.instance.resetChargingDecisionCache();
+      ShellyChargerService.instance.resetChargingDecisionCache();
+    } else if (_chargerControlMode == AppSettings.chargerControlModeBle) {
+      BleChargerService.instance.resetChargingDecisionCache();
+      final launcherDeviceId = await DeviceIdentityService.getOrCreateDeviceId();
+      chargingSaved = await BleChargerService.instance.pushChargingConfig(
+        launcherDeviceId: launcherDeviceId,
+        launcherDeviceName: _deviceNameController.text.trim().isEmpty
+            ? 'Launcher'
+            : _deviceNameController.text.trim(),
+        startBelowPercent: startBelowPercent,
+        stopAtPercent: stopAtPercent,
+        relayPin: int.tryParse(_chargerRelayPin) ?? 26,
+      );
+    } else {
+      ShellyChargerService.instance.resetChargingDecisionCache();
+      final batteryLevel = await _getCurrentBatteryLevel();
+      if (batteryLevel != null) {
+        chargingSaved = await ShellyChargerService.instance.syncChargingDecision(
+          batteryLevel: batteryLevel,
+          startBelowPercent: startBelowPercent,
+          stopAtPercent: stopAtPercent,
+          onUrl: _shellyOnUrlController.text.trim(),
+          offUrl: _shellyOffUrlController.text.trim(),
+          useToggle: _shellyUseToggle,
+          toggleUrl: _shellyToggleUrlController.text.trim(),
+          useAuth: _shellyUseAuth,
+          username: _shellyUsernameController.text.trim(),
+          password: _shellyPasswordController.text,
+        );
+      }
+    }
 
     if (!mounted) {
       return;
     }
 
+    try {
+      debugPrint('[ChargingMonitor][settings-save] requesting refresh reset=true');
+      final result = await _platformChannel.invokeMapMethod<String, dynamic>(
+        'refreshChargingMonitor',
+        {
+          'resetDecisionCache': true,
+        },
+      );
+      debugPrint(
+        '[ChargingMonitor][settings-save] result=${result ?? <String, dynamic>{}}',
+      );
+    } on PlatformException catch (error) {
+      debugPrint('[ChargingMonitor][settings-save] failed: ${error.message}');
+    }
+
+    final shouldRestartForBackgroundServices =
+        previousBackgroundServicesEnabled != _backgroundServicesEnabled;
+    final saveMessage = shouldRestartForBackgroundServices
+        ? 'Settings saved. Restarting launcher to apply background service changes.'
+        : !_chargingControlEnabled
+        ? 'Settings saved. Charging API sending is disabled.'
+        : _chargerControlMode == AppSettings.chargerControlModeShelly
+        ? chargingSaved
+              ? 'Settings saved successfully. Shelly charging was evaluated now.'
+              : 'Settings saved successfully.'
+        : chargingSaved
+        ? 'Settings saved successfully and charger config sent over BLE.'
+        : 'Settings saved successfully.';
+
     ScaffoldMessenger.of(
       context,
     ).showSnackBar(
       SnackBar(
-        content: Text(
-          chargingSaved
-              ? 'Settings saved and charger config sent over BLE.'
-              : 'Settings saved locally. Connect to the charger controller to push config.',
-        ),
+        content: Text(saveMessage),
       ),
     );
+
+    if (shouldRestartForBackgroundServices) {
+      await Future<void>.delayed(const Duration(milliseconds: 600));
+      if (!mounted) {
+        return;
+      }
+      await _rebootDevice();
+    }
   }
 
   Future<void> _pickWallpaper(bool isPortrait) async {
     final result = await FilePicker.platform.pickFiles(
       type: FileType.custom,
-      allowedExtensions: const ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'],
+      allowedExtensions: MediaWallpaperBackground.pickerExtensions,
       allowMultiple: false,
     );
 
@@ -724,52 +986,11 @@ class _SettingsPageState extends State<SettingsPage> {
     }
   }
 
-  Future<void> _resetStandaloneSales() async {
-    final shouldReset = await showDialog<bool>(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) {
-        return AlertDialog(
-          backgroundColor: const Color(0xFF121212),
-          title: const Text(
-            'Reset Standalone Sales',
-            style: TextStyle(color: Colors.white),
-          ),
-          content: const Text(
-            'This will clear the standalone total, daily, weekly, and monthly sales history on this device.',
-            style: TextStyle(color: Colors.white70),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(false),
-              child: const Text('Cancel'),
-            ),
-            ElevatedButton(
-              onPressed: () => Navigator.of(context).pop(true),
-              child: const Text('Reset'),
-            ),
-          ],
-        );
-      },
-    );
-
-    if (shouldReset != true) {
-      return;
-    }
-
-    await LocalDbService.instance.resetStandaloneSales();
-    final refreshed = await LocalDbService.instance.getStandaloneSalesSummary();
-
-    if (!mounted) {
-      return;
-    }
-
-    setState(() {
-      _standaloneSalesSummary = refreshed;
-    });
-
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Standalone sales reset.')),
+  Future<void> _openStandaloneSalesPage() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => const StandaloneSalesPage(),
+      ),
     );
   }
 
@@ -1151,6 +1372,7 @@ class _SettingsPageState extends State<SettingsPage> {
       await AdminPinService.updatePin(
         currentPin: currentController.text.trim(),
         newPin: newController.text.trim(),
+        useLocalOnly: _isStandaloneMode,
       );
 
       if (!mounted) {
@@ -1177,11 +1399,17 @@ class _SettingsPageState extends State<SettingsPage> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _activeSessionTimer?.cancel();
     AudioService().stopAudio();
     _businessNameController.dispose();
     _deviceNameController.dispose();
     _chargerBleNameController.dispose();
+    _shellyOnUrlController.dispose();
+    _shellyOffUrlController.dispose();
+    _shellyToggleUrlController.dispose();
+    _shellyUsernameController.dispose();
+    _shellyPasswordController.dispose();
     _standaloneControllerIpController.dispose();
     _onePesoMinutesController.dispose();
     _fivePesoMinutesController.dispose();
@@ -1224,10 +1452,10 @@ class _SettingsPageState extends State<SettingsPage> {
                       onTap: _showChangeAdminPinDialog,
                     ),
                     _buildTile(
-                      "Restart App",
-                      "Close and relaunch the kiosk app",
-                      Icons.restart_alt,
-                      onTap: _restartApp,
+                      "Power Off",
+                      "Turn off the device",
+                      Icons.power_settings_new,
+                      onTap: _powerOffDevice,
                     ),
                     _buildTile(
                       "Reboot Device",
@@ -1460,18 +1688,23 @@ class _SettingsPageState extends State<SettingsPage> {
                             ),
                           ),
                           ListTile(
+                            leading: const Icon(
+                              Icons.receipt_long,
+                              color: Colors.lightGreenAccent,
+                            ),
                             title: const Text(
                               'Standalone Sales',
                               style: TextStyle(color: Colors.white),
                             ),
-                            subtitle: Text(
-                              'Total: ${_standaloneSalesSummary.total}\nDaily: ${_standaloneSalesSummary.daily}\nWeekly: ${_standaloneSalesSummary.weekly}\nMonthly: ${_standaloneSalesSummary.monthly}',
-                              style: const TextStyle(color: Colors.white70),
+                            subtitle: const Text(
+                              'View totals and coin insert logs.',
+                              style: TextStyle(color: Colors.white70),
                             ),
-                            trailing: OutlinedButton(
-                              onPressed: _resetStandaloneSales,
-                              child: const Text('Reset'),
+                            trailing: const Icon(
+                              Icons.chevron_right,
+                              color: Colors.white70,
                             ),
+                            onTap: _openStandaloneSalesPage,
                           ),
                         ],
                       ],
@@ -1483,28 +1716,91 @@ class _SettingsPageState extends State<SettingsPage> {
                         style: TextStyle(color: Colors.white),
                       ),
                       subtitle: Text(
-                        _chargerBleStatus,
+                        _chargerControlMode == AppSettings.chargerControlModeShelly
+                            ? (_shellyUseAuth
+                                  ? 'Shelly HTTP control with authorization.'
+                                  : 'Shelly HTTP control without authorization.')
+                            : _chargerBleStatus,
                         style: TextStyle(
-                          color: BleChargerService.instance.isConnected
+                          color:
+                              _chargerControlMode == AppSettings.chargerControlModeShelly
+                              ? Colors.white70
+                              : BleChargerService.instance.isConnected
                               ? Colors.greenAccent
                               : Colors.white70,
                         ),
                       ),
                       children: [
+                        SwitchListTile(
+                          title: Text(
+                            _chargingControlEnabled
+                                ? 'Charging API Enabled'
+                                : 'Charging API Disabled',
+                            style: const TextStyle(color: Colors.white),
+                          ),
+                          subtitle: const Text(
+                            'When disabled, the launcher will not send BLE or Shelly charging commands.',
+                            style: TextStyle(color: Colors.white70),
+                          ),
+                          value: _chargingControlEnabled,
+                          onChanged: (value) {
+                            setState(() {
+                              _chargingControlEnabled = value;
+                            });
+                          },
+                        ),
                         Padding(
                           padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
-                          child: TextFormField(
-                            controller: _chargerBleNameController,
+                          child: DropdownButtonFormField<String>(
+                            value: _chargerControlMode,
+                            dropdownColor: const Color(0xFF1A1A1A),
                             style: const TextStyle(color: Colors.white),
+                            iconEnabledColor: Colors.white70,
                             decoration: const InputDecoration(
-                              labelText: 'Charger BLE Name',
+                              labelText: 'Charging Controller',
                               labelStyle: TextStyle(color: Colors.white70),
-                              helperText:
-                                  'Use the unique advertised charger Bluetooth name.',
-                              helperStyle: TextStyle(color: Colors.white54),
                             ),
+                            items: const [
+                              DropdownMenuItem(
+                                value: AppSettings.chargerControlModeBle,
+                                child: Text(
+                                  'BLE Charger Controller',
+                                  style: TextStyle(color: Colors.white),
+                                ),
+                              ),
+                              DropdownMenuItem(
+                                value: AppSettings.chargerControlModeShelly,
+                                child: Text(
+                                  'Shelly HTTP',
+                                  style: TextStyle(color: Colors.white),
+                                ),
+                              ),
+                            ],
+                            onChanged: (value) {
+                              if (value == null) {
+                                return;
+                              }
+                              setState(() {
+                                _chargerControlMode = value;
+                              });
+                            },
                           ),
                         ),
+                        if (_chargerControlMode == AppSettings.chargerControlModeBle)
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+                            child: TextFormField(
+                              controller: _chargerBleNameController,
+                              style: const TextStyle(color: Colors.white),
+                              decoration: const InputDecoration(
+                                labelText: 'Charger BLE Name',
+                                labelStyle: TextStyle(color: Colors.white70),
+                                helperText:
+                                    'Use the unique advertised charger Bluetooth name.',
+                                helperStyle: TextStyle(color: Colors.white54),
+                              ),
+                            ),
+                          ),
                         Padding(
                           padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
                           child: TextFormField(
@@ -1529,42 +1825,164 @@ class _SettingsPageState extends State<SettingsPage> {
                             ),
                           ),
                         ),
-                        Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 16),
-                          child: Row(
-                            children: [
-                              Expanded(
-                                child: OutlinedButton(
-                                  onPressed: _isBleScanning ? null : _scanForChargers,
-                                  child: Text(
-                                    _isBleScanning ? 'Scanning...' : 'Scan',
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(width: 12),
-                              Expanded(
-                                child: OutlinedButton(
-                                  onPressed: _isBleConnecting
-                                      ? null
-                                      : _connectToSavedCharger,
-                                  child: Text(
-                                    _isBleConnecting ? 'Connecting...' : 'Connect',
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(width: 12),
-                              Expanded(
-                                child: OutlinedButton(
-                                  onPressed: BleChargerService.instance.isConnected
-                                      ? _disconnectCharger
-                                      : null,
-                                  child: const Text('Disconnect'),
-                                ),
-                              ),
-                            ],
+                        if (_chargerControlMode == AppSettings.chargerControlModeShelly)
+                          SwitchListTile(
+                            title: const Text(
+                              'Use Shelly Toggle Command',
+                              style: TextStyle(color: Colors.white),
+                            ),
+                            subtitle: const Text(
+                              'When enabled, ON/OFF URLs are disabled and the toggle URL is used instead.',
+                              style: TextStyle(color: Colors.white70),
+                            ),
+                            value: _shellyUseToggle,
+                            onChanged: (value) {
+                              setState(() {
+                                _shellyUseToggle = value;
+                              });
+                            },
                           ),
-                        ),
-                        if (_chargerScanResults.isNotEmpty)
+                        if (_chargerControlMode == AppSettings.chargerControlModeShelly &&
+                            _shellyUseToggle)
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+                            child: TextFormField(
+                              controller: _shellyToggleUrlController,
+                              keyboardType: TextInputType.url,
+                              style: const TextStyle(color: Colors.white),
+                              decoration: const InputDecoration(
+                                labelText: 'Shelly Toggle Command URL',
+                                labelStyle: TextStyle(color: Colors.white70),
+                                helperText:
+                                    'Example: http://192.168.1.4/relay/1?turn=toggle',
+                                helperStyle: TextStyle(color: Colors.white54),
+                              ),
+                            ),
+                          ),
+                        if (_chargerControlMode == AppSettings.chargerControlModeShelly)
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+                            child: TextFormField(
+                              controller: _shellyOnUrlController,
+                              enabled: !_shellyUseToggle,
+                              keyboardType: TextInputType.url,
+                              style: TextStyle(
+                                color: _shellyUseToggle
+                                    ? Colors.white38
+                                    : Colors.white,
+                              ),
+                              decoration: const InputDecoration(
+                                labelText: 'Shelly ON Command URL',
+                                labelStyle: TextStyle(color: Colors.white70),
+                                helperText:
+                                    'Example: http://192.168.1.5/relay/0?turn=on',
+                                helperStyle: TextStyle(color: Colors.white54),
+                              ),
+                            ),
+                          ),
+                        if (_chargerControlMode == AppSettings.chargerControlModeShelly)
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+                            child: TextFormField(
+                              controller: _shellyOffUrlController,
+                              enabled: !_shellyUseToggle,
+                              keyboardType: TextInputType.url,
+                              style: TextStyle(
+                                color: _shellyUseToggle
+                                    ? Colors.white38
+                                    : Colors.white,
+                              ),
+                              decoration: const InputDecoration(
+                                labelText: 'Shelly OFF Command URL',
+                                labelStyle: TextStyle(color: Colors.white70),
+                                helperText:
+                                    'Example: http://192.168.1.5/relay/0?turn=off',
+                                helperStyle: TextStyle(color: Colors.white54),
+                              ),
+                            ),
+                          ),
+                        if (_chargerControlMode == AppSettings.chargerControlModeShelly)
+                          SwitchListTile(
+                            title: const Text(
+                              'Authorization',
+                              style: TextStyle(color: Colors.white),
+                            ),
+                            subtitle: const Text(
+                              'Enable when Shelly requires a username and password.',
+                              style: TextStyle(color: Colors.white70),
+                            ),
+                            value: _shellyUseAuth,
+                            onChanged: (value) {
+                              setState(() {
+                                _shellyUseAuth = value;
+                              });
+                            },
+                          ),
+                        if (_chargerControlMode == AppSettings.chargerControlModeShelly &&
+                            _shellyUseAuth)
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+                            child: TextFormField(
+                              controller: _shellyUsernameController,
+                              style: const TextStyle(color: Colors.white),
+                              decoration: const InputDecoration(
+                                labelText: 'Username',
+                                labelStyle: TextStyle(color: Colors.white70),
+                              ),
+                            ),
+                          ),
+                        if (_chargerControlMode == AppSettings.chargerControlModeShelly &&
+                            _shellyUseAuth)
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+                            child: TextFormField(
+                              controller: _shellyPasswordController,
+                              obscureText: true,
+                              style: const TextStyle(color: Colors.white),
+                              decoration: const InputDecoration(
+                                labelText: 'Password',
+                                labelStyle: TextStyle(color: Colors.white70),
+                              ),
+                            ),
+                          ),
+                        if (_chargerControlMode == AppSettings.chargerControlModeBle)
+                          Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 16),
+                            child: Row(
+                              children: [
+                                Expanded(
+                                  child: OutlinedButton(
+                                    onPressed: _isBleScanning ? null : _scanForChargers,
+                                    child: Text(
+                                      _isBleScanning ? 'Scanning...' : 'Scan',
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: OutlinedButton(
+                                    onPressed: _isBleConnecting
+                                        ? null
+                                        : _connectToSavedCharger,
+                                    child: Text(
+                                      _isBleConnecting ? 'Connecting...' : 'Connect',
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: OutlinedButton(
+                                    onPressed: BleChargerService.instance.isConnected
+                                        ? _disconnectCharger
+                                        : null,
+                                    child: const Text('Disconnect'),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        if (_chargerControlMode == AppSettings.chargerControlModeBle &&
+                            _chargerScanResults.isNotEmpty)
                           Padding(
                             padding: const EdgeInsets.fromLTRB(8, 12, 8, 8),
                             child: Column(
@@ -1703,57 +2121,115 @@ class _SettingsPageState extends State<SettingsPage> {
                       Icons.wifi,
                       onTap: _openWifiSettings,
                     ),
-                    ExpansionTile(
-                      leading: const Icon(
-                        Icons.electrical_services,
-                        color: Colors.lightGreenAccent,
+                    _buildTile(
+                      "Time Overlay",
+                      "Show the remaining session time above other apps.",
+                      Icons.timer_outlined,
+                      onTap: _openTimeOverlayPermissionSettings,
+                      trailing: Text(
+                        _timeOverlayPermissionGranted
+                            ? 'Enabled'
+                            : 'Not Enabled',
+                        style: TextStyle(
+                          color: _timeOverlayPermissionGranted
+                              ? Colors.lightGreenAccent
+                              : Colors.redAccent,
+                          fontWeight: FontWeight.w700,
+                        ),
                       ),
+                    ),
+                    _buildTile(
+                      "Test Time Overlay",
+                      "Show a 2-minute overlay now to verify permission and placement.",
+                      Icons.play_circle_outline,
+                      onTap: _testTimeOverlay,
+                    ),
+                    SwitchListTile(
                       title: const Text(
-                        "Charging Relay Assignment",
+                        "Kiosk Mode",
+                        style: TextStyle(color: Colors.white),
+                      ),
+                      subtitle: Text(
+                        _kioskModeEnabled
+                            ? "Enabled. Launcher policies and kiosk restrictions stay active."
+                            : "Disabled. App unpins and Play Store installs are allowed after save.",
+                        style: const TextStyle(color: Colors.white70),
+                      ),
+                      value: _kioskModeEnabled,
+                      onChanged: (val) {
+                        setState(() {
+                          _kioskModeEnabled = val;
+                        });
+                      },
+                    ),
+                    SwitchListTile(
+                      title: const Text(
+                        "Background Services",
                         style: TextStyle(color: Colors.white),
                       ),
                       subtitle: const Text(
-                        "Choose which relay pin this launcher controls.",
+                        "Turn off overnight to stop launcher sync, polling, and keep-alive work while idle.",
                         style: TextStyle(color: Colors.white70),
                       ),
-                      children: [
-                        Padding(
-                          padding: const EdgeInsets.all(16.0),
-                          child: DropdownButtonFormField<String>(
-                            dropdownColor: const Color(0xFF1A1A1A),
-                            style: const TextStyle(color: Colors.white),
-                            iconEnabledColor: Colors.white70,
-                            decoration: const InputDecoration(
-                              labelText: "Relay PIN",
-                              labelStyle: TextStyle(color: Colors.white70),
-                            ),
-                            initialValue: _chargerRelayPin,
-                            items:
-                                const ['26', '27', '32', '33']
-                                    .map(
-                                      (pin) => DropdownMenuItem(
-                                        value: pin,
-                                        child: Text(
-                                          'Relay $pin',
-                                          style: const TextStyle(
-                                            color: Colors.white,
+                      value: _backgroundServicesEnabled,
+                      onChanged: (val) {
+                        setState(() {
+                          _backgroundServicesEnabled = val;
+                        });
+                      },
+                    ),
+                    if (_chargerControlMode == AppSettings.chargerControlModeBle)
+                      ExpansionTile(
+                        leading: const Icon(
+                          Icons.electrical_services,
+                          color: Colors.lightGreenAccent,
+                        ),
+                        title: const Text(
+                          "Charging Relay Assignment",
+                          style: TextStyle(color: Colors.white),
+                        ),
+                        subtitle: const Text(
+                          "Choose which relay pin this launcher controls.",
+                          style: TextStyle(color: Colors.white70),
+                        ),
+                        children: [
+                          Padding(
+                            padding: const EdgeInsets.all(16.0),
+                            child: DropdownButtonFormField<String>(
+                              dropdownColor: const Color(0xFF1A1A1A),
+                              style: const TextStyle(color: Colors.white),
+                              iconEnabledColor: Colors.white70,
+                              decoration: const InputDecoration(
+                                labelText: "Relay PIN",
+                                labelStyle: TextStyle(color: Colors.white70),
+                              ),
+                              initialValue: _chargerRelayPin,
+                              items:
+                                  const ['26', '27', '32', '33']
+                                      .map(
+                                        (pin) => DropdownMenuItem(
+                                          value: pin,
+                                          child: Text(
+                                            'Relay $pin',
+                                            style: const TextStyle(
+                                              color: Colors.white,
+                                            ),
                                           ),
                                         ),
-                                      ),
-                                    )
-                                    .toList(),
-                            onChanged: (value) {
-                              if (value == null) {
-                                return;
-                              }
-                              setState(() {
-                                _chargerRelayPin = value;
-                              });
-                            },
+                                      )
+                                      .toList(),
+                              onChanged: (value) {
+                                if (value == null) {
+                                  return;
+                                }
+                                setState(() {
+                                  _chargerRelayPin = value;
+                                });
+                              },
+                            ),
                           ),
-                        ),
-                      ],
-                    ),
+                        ],
+                      ),
                     ExpansionTile(
                       leading: const Icon(
                         Icons.notifications_active,
@@ -1898,13 +2374,13 @@ class _SettingsPageState extends State<SettingsPage> {
         const SizedBox(height: 20),
 
         _buildWallpaperSection(
-          label: 'Portrait Wallpaper',
+          label: 'Portrait Wallpaper / Video',
           path: _portraitWallpaperPath,
           onBrowse: () => _pickWallpaper(true),
           onClear: () => _clearWallpaper(true),
         ),
         _buildWallpaperSection(
-          label: 'Landscape Wallpaper',
+          label: 'Landscape Wallpaper / Video',
           path: _landscapeWallpaperPath,
           onBrowse: () => _pickWallpaper(false),
           onClear: () => _clearWallpaper(false),
@@ -2098,6 +2574,13 @@ class _SettingsPageState extends State<SettingsPage> {
             hasValue ? path : 'No file selected',
             style: const TextStyle(color: Colors.white70),
           ),
+          if (hasValue) ...[
+            const SizedBox(height: 4),
+            Text(
+              '${MediaWallpaperBackground.mediaTypeLabel(path)} wallpaper',
+              style: const TextStyle(color: Colors.white54, fontSize: 12),
+            ),
+          ],
           const SizedBox(height: 12),
           Row(
             children: [

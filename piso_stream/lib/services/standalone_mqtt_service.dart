@@ -146,7 +146,15 @@ class StandaloneMqttService {
       },
     );
 
-    final effectiveResponse = response ?? _latestControllerStatus;
+    final fallbackStatus = response == null
+        ? await ping(
+            launcherDeviceId: launcherDeviceId,
+            launcherDeviceName: launcherDeviceName,
+          )
+        : null;
+
+    final effectiveResponse =
+        response ?? fallbackStatus ?? _latestControllerStatus;
     if (effectiveResponse == null) {
       return const MqttCoinOpenResult(
         allowed: false,

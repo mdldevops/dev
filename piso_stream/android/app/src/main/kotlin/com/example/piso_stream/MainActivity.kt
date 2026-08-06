@@ -10,6 +10,7 @@ import android.content.Context
 import android.content.ComponentName
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.BroadcastReceiver
 import android.media.AudioAttributes
 import android.media.AudioManager
 import android.media.MediaPlayer
@@ -48,6 +49,7 @@ import androidx.core.content.ContextCompat
 import java.util.LinkedHashSet
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.embedding.android.FlutterActivity
@@ -72,12 +74,19 @@ class MainActivity : FlutterActivity() {
     private val flutterPrefsName = "FlutterSharedPreferences"
     private val currentCustomerRolePrefKey = "flutter.current_customer_role"
     private val sessionExpiresAtPrefKey = "flutter.session_expires_at"
+    private val kioskModeEnabledPrefKey = "flutter.kiosk_mode_enabled"
     private val audioVolumePrefKey = "flutter.audio_volume"
     private val userAudioVolumePrefKey = "flutter.user_audio_volume"
     private val lastLaunchedAppKey = "last_launched_app_package"
     private val allowAppUpdatesKey = "allow_app_updates"
     private val youtubePackageName = "com.google.android.youtube"
     private val playStorePackageName = "com.android.vending"
+    private val packageInstallerPackageNames = arrayOf(
+        "com.google.android.packageinstaller",
+        "com.android.packageinstaller",
+        "com.android.permissioncontroller",
+        "com.miui.packageinstaller"
+    )
     private val finalCountdownLockSeconds = 20L
     private val homeShortcutWindowMs = 2000L
     private val audioFadeDurationMs = 500L
@@ -91,6 +100,7 @@ class MainActivity : FlutterActivity() {
     private var targetAudioVolume = 0.5f
     private var sessionWakeLock: PowerManager.WakeLock? = null
     private var lastHomeLauncherTapAtMs = 0L
+    private val resetExecutor = Executors.newSingleThreadExecutor()
     private val adminComponent by lazy {
         ComponentName(this, KioskDeviceAdminReceiver::class.java)
     }
@@ -100,21 +110,54 @@ class MainActivity : FlutterActivity() {
     private val audioManager by lazy {
         getSystemService(Context.AUDIO_SERVICE) as? AudioManager
     }
+    private val batteryStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                Intent.ACTION_BATTERY_CHANGED,
+                Intent.ACTION_POWER_CONNECTED,
+                Intent.ACTION_POWER_DISCONNECTED -> {
+                    ChargingMonitorReceiver.triggerRefresh(applicationContext, false)
+                }
+            }
+        }
+    }
+    private var batteryReceiverRegistered = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        ChargingMonitorReceiver.scheduleNext(this, 5000L)
+        ChargingMonitorService.start(this)
+        registerBatteryStateReceiver()
         adoptDeviceRotationPreference()
         handleLaunchIntent(intent)
         createNotificationChannel()
         requestNotificationPermissionIfNeeded()
         applySavedAudioVolumePreference()
-        applyImmersiveMode()
+        if (isKioskModeEnabled()) {
+            applyImmersiveMode()
+        } else {
+            restoreNormalSystemUi()
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
         handleLaunchIntent(intent)
+    }
+
+    override fun onDestroy() {
+        if (batteryReceiverRegistered) {
+            try {
+                unregisterReceiver(batteryStateReceiver)
+            } catch (_: Exception) {
+            }
+            batteryReceiverRegistered = false
+        }
+        releaseSessionWakeLock()
+        stopAudio(immediate = true)
+        stopEffectAudio()
+        super.onDestroy()
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -124,12 +167,21 @@ class MainActivity : FlutterActivity() {
             .setMethodCallHandler { call, result ->
                 when (call.method) {
                     "getInstalledApps" -> result.success(getInstalledApps())
+                    "getInstalledAppsForPackages" -> {
+                        val packageNames = call.argument<List<String>>("packageNames").orEmpty()
+                        result.success(getInstalledAppsForPackages(packageNames))
+                    }
                     "enterKioskMode" -> {
                         enterKioskMode()
                         result.success(null)
                     }
                     "exitKioskMode" -> {
                         exitKioskMode()
+                        result.success(null)
+                    }
+                    "setKioskModeEnabled" -> {
+                        val enabled = call.argument<Boolean>("enabled") ?: true
+                        setKioskModeEnabled(enabled)
                         result.success(null)
                     }
                     "isDeviceOwner" -> {
@@ -205,16 +257,19 @@ class MainActivity : FlutterActivity() {
                     }
                     "resetWhitelistedApps" -> {
                         val packageNames = call.argument<List<String>>("packageNames").orEmpty()
-                        val failures = resetWhitelistedApps(packageNames)
-
-                        if (failures.isEmpty()) {
-                            result.success(null)
-                        } else {
-                            result.error(
-                                "RESET_FAILED",
-                                "Unable to reset: ${failures.joinToString(", ")}",
-                                failures
-                            )
+                        resetExecutor.execute {
+                            val failures = resetWhitelistedApps(packageNames)
+                            runOnUiThread {
+                                if (failures.isEmpty()) {
+                                    result.success(null)
+                                } else {
+                                    result.error(
+                                        "RESET_FAILED",
+                                        "Unable to reset: ${failures.joinToString(", ")}",
+                                        failures
+                                    )
+                                }
+                            }
                         }
                     }
                     "launchApp" -> {
@@ -276,9 +331,74 @@ class MainActivity : FlutterActivity() {
                         cancelSessionMonitoring()
                         result.success(null)
                     }
+                    "canDrawTimeOverlay" -> {
+                        result.success(Settings.canDrawOverlays(this))
+                    }
+                    "openTimeOverlayPermissionSettings" -> {
+                        if (openTimeOverlayPermissionSettings()) {
+                            result.success(null)
+                        } else {
+                            result.error(
+                                "OVERLAY_SETTINGS_UNAVAILABLE",
+                                "Unable to open overlay permission settings.",
+                                null
+                            )
+                        }
+                    }
+                    "startRemainingTimeOverlay" -> {
+                        val displayRemainingMs =
+                            (call.argument<Number>("displayRemainingMs"))?.toLong()
+                        val countdownMultiplier =
+                            (call.argument<Number>("countdownMultiplier"))?.toDouble() ?: 1.0
+                        if (displayRemainingMs == null) {
+                            result.error(
+                                "INVALID_DISPLAY_REMAINING",
+                                "displayRemainingMs is required for the time overlay.",
+                                null
+                            )
+                        } else {
+                            startRemainingTimeOverlay(displayRemainingMs, countdownMultiplier)
+                            result.success(null)
+                        }
+                    }
+                    "startOpenTimeOverlay" -> {
+                        startOpenTimeOverlay()
+                        result.success(null)
+                    }
+                    "stopRemainingTimeOverlay" -> {
+                        stopRemainingTimeOverlay()
+                        result.success(null)
+                    }
+                    "testRemainingTimeOverlay" -> {
+                        startRemainingTimeOverlay(
+                            TimeUnit.MINUTES.toMillis(2),
+                            1.0
+                        )
+                        result.success(null)
+                    }
                     "requestNotificationPermission" -> {
                         requestNotificationPermissionIfNeeded()
                         result.success(null)
+                    }
+                    "refreshChargingMonitor" -> {
+                        val resetDecisionCache =
+                            call.argument<Boolean>("resetDecisionCache") ?: false
+                        ChargingMonitorService.start(this)
+                        if (resetDecisionCache) {
+                            ChargingMonitorReceiver.triggerRefresh(
+                                this,
+                                resetDecisionCache = true
+                            )
+                        }
+                        try {
+                            result.success(ChargingMonitorReceiver.evaluateNow(this))
+                        } catch (error: Exception) {
+                            result.error(
+                                "CHARGING_MONITOR_FAILED",
+                                error.message ?: "Charging monitor failed.",
+                                null
+                            )
+                        }
                     }
                     "prepareForAppUpdate" -> {
                         prepareForAppUpdate()
@@ -291,8 +411,15 @@ class MainActivity : FlutterActivity() {
 
     override fun onResume() {
         super.onResume()
+        stopRemainingTimeOverlay()
+        ChargingMonitorService.start(this)
+        ChargingMonitorReceiver.triggerRefresh(this, resetDecisionCache = false)
         adoptDeviceRotationPreference()
         applySavedAudioVolumePreference()
+        if (!isKioskModeEnabled()) {
+            disableKioskModeSafely(returnToSystemHome = false)
+            return
+        }
         applyImmersiveMode()
         if (isAdminWifiSessionActive) {
             isAdminWifiSessionActive = false
@@ -311,6 +438,7 @@ class MainActivity : FlutterActivity() {
         }
 
         if (intent?.getBooleanExtra(EXTRA_ENFORCE_CLOSE_RETURN, false) == true) {
+            stopRemainingTimeOverlay()
             closeCurrentOpenAppBeforeReturn()
             intent.removeExtra(EXTRA_ENFORCE_CLOSE_RETURN)
         }
@@ -337,9 +465,10 @@ class MainActivity : FlutterActivity() {
         val lastLaunchedAppPackage = kioskPolicyPrefs.getString(lastLaunchedAppKey, null)
         if (lastLaunchedAppPackage != null && lastLaunchedAppPackage != packageName) {
             Log.d(logTag, "Force-stopping last launched app: $lastLaunchedAppPackage")
-            forceStopAndClear(lastLaunchedAppPackage)
+            forceStopTrackedPackage(lastLaunchedAppPackage)
             kioskPolicyPrefs.edit().remove(lastLaunchedAppKey).apply()
         }
+        stopRemainingTimeOverlay()
         intent.removeExtra(EXTRA_SESSION_EXPIRED)
         Log.d(logTag, "Handled session-expired launch intent")
     }
@@ -371,21 +500,43 @@ class MainActivity : FlutterActivity() {
         Log.d(logTag, "Double-home detected, closing current app and returning to menu")
         wakeAndKeepScreenOn()
         closeCurrentOpenAppBeforeReturn()
-        applyImmersiveMode()
+        if (isKioskModeEnabled()) {
+            applyImmersiveMode()
+        }
         lastHomeLauncherTapAtMs = 0L
+    }
+
+    private fun registerBatteryStateReceiver() {
+        if (batteryReceiverRegistered) {
+            return
+        }
+
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_BATTERY_CHANGED)
+            addAction(Intent.ACTION_POWER_CONNECTED)
+            addAction(Intent.ACTION_POWER_DISCONNECTED)
+        }
+
+        try {
+            registerReceiver(batteryStateReceiver, filter)
+            batteryReceiverRegistered = true
+        } catch (error: Exception) {
+            Log.w(logTag, "Unable to register battery receiver", error)
+        }
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) {
+        if (hasFocus && isKioskModeEnabled()) {
             applyImmersiveMode()
         }
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        if (event.keyCode == KeyEvent.KEYCODE_VOLUME_UP ||
+        if (isKioskModeEnabled() &&
+            (event.keyCode == KeyEvent.KEYCODE_VOLUME_UP ||
             event.keyCode == KeyEvent.KEYCODE_VOLUME_DOWN ||
-            event.keyCode == KeyEvent.KEYCODE_VOLUME_MUTE
+            event.keyCode == KeyEvent.KEYCODE_VOLUME_MUTE)
         ) {
             applySavedAudioVolumePreference()
             return true
@@ -394,14 +545,11 @@ class MainActivity : FlutterActivity() {
         return super.dispatchKeyEvent(event)
     }
 
-    override fun onDestroy() {
-        releaseSessionWakeLock()
-        stopAudio(immediate = true)
-        stopEffectAudio()
-        super.onDestroy()
-    }
-
     private fun enterKioskMode() {
+        if (!isKioskModeEnabled()) {
+            disableKioskModeSafely()
+            return
+        }
         applyImmersiveMode()
         applyHardKioskPolicies()
 
@@ -432,6 +580,61 @@ class MainActivity : FlutterActivity() {
             stopLockTask()
         } catch (_: IllegalArgumentException) {
         } catch (_: IllegalStateException) {
+        }
+    }
+
+    private fun setKioskModeEnabled(enabled: Boolean) {
+        getSharedPreferences(flutterPrefsName, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(kioskModeEnabledPrefKey, enabled)
+            .apply()
+
+        if (enabled) {
+            enableKioskModeSafely()
+            return
+        }
+
+        stopRemainingTimeOverlay()
+        disableKioskModeSafely(returnToSystemHome = true)
+    }
+
+    private fun enableKioskModeSafely() {
+        try {
+            applyHardKioskPolicies()
+            if (!isCurrentlyInLockTaskMode()) {
+                enterKioskMode()
+            }
+        } catch (error: Exception) {
+            Log.e(logTag, "Failed to enable kiosk mode safely", error)
+        }
+    }
+
+    private fun disableKioskModeSafely(returnToSystemHome: Boolean = false) {
+        restoreNormalSystemUi()
+
+        try {
+            exitKioskMode()
+        } catch (error: Exception) {
+            Log.e(logTag, "Failed while exiting kiosk mode", error)
+        }
+
+        try {
+            clearHardKioskPolicies()
+        } catch (error: Exception) {
+            Log.e(logTag, "Failed while clearing kiosk policies", error)
+        }
+
+        try {
+            exitKioskMode()
+        } catch (error: Exception) {
+            Log.e(logTag, "Failed while exiting kiosk mode", error)
+        }
+
+        if (returnToSystemHome) {
+            Handler(Looper.getMainLooper()).postDelayed(
+                { launchSystemHomeAndFinish() },
+                350L
+            )
         }
     }
 
@@ -488,8 +691,8 @@ class MainActivity : FlutterActivity() {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                 dpm.addUserRestriction(adminComponent, "no_multiwindow")
             }
+            dpm.clearUserRestriction(adminComponent, UserManager.DISALLOW_FACTORY_RESET)
             dpm.addUserRestriction(adminComponent, UserManager.DISALLOW_SAFE_BOOT)
-            dpm.addUserRestriction(adminComponent, UserManager.DISALLOW_FACTORY_RESET)
             dpm.addUserRestriction(adminComponent, UserManager.DISALLOW_ADD_USER)
             dpm.addUserRestriction(adminComponent, UserManager.DISALLOW_MOUNT_PHYSICAL_MEDIA)
             dpm.addUserRestriction(adminComponent, UserManager.DISALLOW_APPS_CONTROL)
@@ -498,10 +701,107 @@ class MainActivity : FlutterActivity() {
                 logTag,
                 "Applied kiosk policies. permitted=${dpm.isLockTaskPermitted(packageName)} active=${isCurrentlyInLockTaskMode()}"
             )
-        } catch (error: SecurityException) {
-            error.printStackTrace()
-        } catch (error: IllegalArgumentException) {
-            error.printStackTrace()
+        } catch (error: Exception) {
+            Log.e(logTag, "Failed to apply kiosk policies", error)
+        }
+    }
+
+    private fun clearHardKioskPolicies() {
+        if (!isDeviceOwnerApp()) {
+            return
+        }
+
+        val dpm = devicePolicyManager ?: return
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                dpm.setLockTaskFeatures(
+                    adminComponent,
+                    DevicePolicyManager.LOCK_TASK_FEATURE_NONE
+                )
+            }
+            dpm.clearPackagePersistentPreferredActivities(adminComponent, packageName)
+            dpm.setLockTaskPackages(adminComponent, emptyArray())
+            dpm.setStatusBarDisabled(adminComponent, false)
+            dpm.setKeyguardDisabled(adminComponent, false)
+            dpm.clearUserRestriction(adminComponent, UserManager.DISALLOW_INSTALL_APPS)
+            dpm.clearUserRestriction(adminComponent, "no_install_unknown_sources")
+            dpm.clearUserRestriction(adminComponent, "no_install_unknown_sources_globally")
+            dpm.clearUserRestriction(adminComponent, UserManager.DISALLOW_SAFE_BOOT)
+            dpm.clearUserRestriction(adminComponent, UserManager.DISALLOW_ADD_USER)
+            dpm.clearUserRestriction(adminComponent, UserManager.DISALLOW_MOUNT_PHYSICAL_MEDIA)
+            dpm.clearUserRestriction(adminComponent, UserManager.DISALLOW_APPS_CONTROL)
+            dpm.clearUserRestriction(adminComponent, UserManager.DISALLOW_UNINSTALL_APPS)
+            dpm.clearUserRestriction(adminComponent, "no_app_multiwindow")
+            dpm.clearUserRestriction(adminComponent, "no_multiwindow")
+            restoreInstallAccess(dpm)
+            Log.d(logTag, "Cleared kiosk policies and restored normal device behavior")
+        } catch (error: Exception) {
+            Log.e(logTag, "Failed to clear kiosk policies", error)
+        }
+    }
+
+    private fun restoreInstallAccess(dpm: DevicePolicyManager) {
+        val packagesToRestore = arrayOf(playStorePackageName, *packageInstallerPackageNames)
+        for (targetPackage in packagesToRestore) {
+            try {
+                dpm.setApplicationHidden(adminComponent, targetPackage, false)
+            } catch (error: Exception) {
+                Log.w(logTag, "Unable to unhide install package $targetPackage", error)
+            }
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            try {
+                dpm.setPackagesSuspended(adminComponent, packagesToRestore, false)
+            } catch (error: Exception) {
+                Log.w(logTag, "Unable to unsuspend install packages", error)
+            }
+        }
+    }
+
+    private fun restoreNormalSystemUi() {
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.insetsController?.show(
+                WindowInsets.Type.statusBars() or
+                    WindowInsets.Type.navigationBars() or
+                    WindowInsets.Type.systemBars()
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
+        }
+    }
+
+    private fun launchSystemHomeAndFinish() {
+        restoreNormalSystemUi()
+        val homeIntent = Intent(Intent.ACTION_MAIN).apply {
+            addCategory(Intent.CATEGORY_HOME)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+
+        try {
+            val resolvedHome = packageManager.resolveActivity(
+                homeIntent,
+                PackageManager.MATCH_DEFAULT_ONLY
+            )
+            if (resolvedHome?.activityInfo?.packageName == packageName) {
+                val homeSettingsIntent = Intent(Settings.ACTION_HOME_SETTINGS).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                startActivity(homeSettingsIntent)
+            } else {
+                startActivity(homeIntent)
+            }
+        } catch (error: Exception) {
+            Log.w(logTag, "Unable to launch system home after kiosk disable", error)
+        }
+
+        try {
+            finishAndRemoveTask()
+        } catch (_: Exception) {
+            finish()
         }
     }
 
@@ -579,7 +879,9 @@ class MainActivity : FlutterActivity() {
                 }
             }
 
-            applyImmersiveMode()
+            if (isKioskModeEnabled()) {
+                applyImmersiveMode()
+            }
             Log.d(logTag, "Requested wake-and-screen-on for launcher return")
         } catch (error: Exception) {
             Log.w(logTag, "Unable to wake screen for launcher return", error)
@@ -630,6 +932,42 @@ class MainActivity : FlutterActivity() {
                     .thenBy { (it["packageName"] as? String)?.lowercase() ?: "" }
             )
             .toList()
+    }
+
+    private fun getInstalledAppsForPackages(packageNames: List<String>): List<Map<String, Any>> {
+        return packageNames
+            .asSequence()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && it != packageName }
+            .mapNotNull(::resolveInstalledAppForPackage)
+            .toList()
+    }
+
+    private fun resolveInstalledAppForPackage(targetPackageName: String): Map<String, Any>? {
+        return try {
+            val launchIntent = resolveLaunchIntentForPackage(targetPackageName)
+            val appLabel = if (launchIntent?.component != null) {
+                val resolveInfo = packageManager.resolveActivity(launchIntent, PackageManager.MATCH_ALL)
+                resolveInfo?.loadLabel(packageManager)?.toString()
+            } else {
+                null
+            }
+
+            val applicationInfo = packageManager.getApplicationInfo(targetPackageName, 0)
+            val appName = appLabel
+                ?: packageManager.getApplicationLabel(applicationInfo)?.toString()
+                ?: targetPackageName
+            val iconBytes = drawableToByteArray(packageManager.getApplicationIcon(applicationInfo))
+
+            mapOf(
+                "appName" to appName,
+                "packageName" to targetPackageName,
+                "icon" to iconBytes
+            )
+        } catch (error: Exception) {
+            Log.w(logTag, "Unable to resolve installed app for package $targetPackageName", error)
+            null
+        }
     }
 
     private fun createNotificationChannel() {
@@ -802,6 +1140,7 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun cancelSessionMonitoring() {
+        stopRemainingTimeOverlay()
         val alarmManager = getSystemService(AlarmManager::class.java) ?: return
         alarmManager.cancel(
             buildSessionAlarmPendingIntent(
@@ -889,6 +1228,7 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun returnLauncherToFront() {
+        stopRemainingTimeOverlay()
         wakeAndKeepScreenOn()
         closeCurrentOpenAppBeforeReturn()
 
@@ -950,7 +1290,7 @@ class MainActivity : FlutterActivity() {
         val closeResults = targetPackages.map { targetPackage ->
             val suspendedByPolicy = temporarilySuspendAndRestorePackage(targetPackage)
             val hiddenByPolicy = temporarilyHideAndRestorePackage(targetPackage)
-            val forceStopped = runShellCommand("am force-stop $targetPackage")
+            val forceStopped = aggressivelyForceStopPackage(targetPackage)
             closeApplied = closeApplied || suspendedByPolicy || hiddenByPolicy || forceStopped
             "$targetPackage[suspend=$suspendedByPolicy hide=$hiddenByPolicy force=$forceStopped]"
         }
@@ -1379,7 +1719,8 @@ class MainActivity : FlutterActivity() {
         }
 
         val isPolicyExemptPackage = isPolicyExemptLaunchPackage(targetPackageName)
-        if (!isPolicyExemptPackage) {
+        val kioskModeEnabled = isKioskModeEnabled()
+        if (kioskModeEnabled && !isPolicyExemptPackage) {
             applyHardKioskPolicies()
             allowPackageForAppLaunch(
                 targetPackageName,
@@ -1387,8 +1728,9 @@ class MainActivity : FlutterActivity() {
             )
         }
         launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        ChargingMonitorReceiver.triggerRefresh(this, false)
 
-        if (isPolicyExemptPackage) {
+        if (kioskModeEnabled && isPolicyExemptPackage) {
             return try {
                 isPolicyExemptLaunchActive = true
                 prepareForAdminSettingsLaunch()
@@ -1397,6 +1739,7 @@ class MainActivity : FlutterActivity() {
                     try {
                         startActivity(launchIntent)
                     } catch (error: Exception) {
+                        stopRemainingTimeOverlay()
                         isPolicyExemptLaunchActive = false
                         Log.w(logTag, "Failed to launch exempt package $targetPackageName: ${error.message}")
                     }
@@ -1415,7 +1758,9 @@ class MainActivity : FlutterActivity() {
 
         return try {
             applySavedAudioVolumePreference()
-            enforceStatusBarLock()
+            if (kioskModeEnabled) {
+                enforceStatusBarLock()
+            }
             applyImmersiveMode()
             startActivity(launchIntent)
             getSharedPreferences(policyPrefsName, Context.MODE_PRIVATE)
@@ -1424,13 +1769,70 @@ class MainActivity : FlutterActivity() {
                 .apply()
             true
         } catch (error: Exception) {
+            stopRemainingTimeOverlay()
             Log.w(logTag, "Failed to launch package $targetPackageName: ${error.message}")
             false
         }
     }
 
+    private fun startRemainingTimeOverlayIfPermitted() {
+        val expiresAtMs = getSharedPreferences(flutterPrefsName, Context.MODE_PRIVATE)
+            .getLong(sessionExpiresAtPrefKey, 0L)
+        val displayRemainingMs =
+            (expiresAtMs - System.currentTimeMillis()).coerceAtLeast(0L)
+        startRemainingTimeOverlay(displayRemainingMs, 1.0)
+    }
+
+    private fun startRemainingTimeOverlay(displayRemainingMs: Long, countdownMultiplier: Double) {
+        if (displayRemainingMs <= 0L) {
+            stopRemainingTimeOverlay()
+            return
+        }
+
+        if (!Settings.canDrawOverlays(this)) {
+            Log.d(logTag, "Remaining time overlay permission not granted")
+            return
+        }
+
+        Log.d(
+            logTag,
+            "Starting remaining time overlay displayRemainingMs=$displayRemainingMs multiplier=$countdownMultiplier"
+        )
+        RemainingTimeOverlayController.showCountdown(this, displayRemainingMs, countdownMultiplier)
+    }
+
+    private fun startOpenTimeOverlay() {
+        if (!Settings.canDrawOverlays(this)) {
+            Log.d(logTag, "Open-time overlay permission not granted")
+            return
+        }
+
+        Log.d(logTag, "Starting open-time overlay")
+        RemainingTimeOverlayController.showLabel(this, "OPEN TIME")
+    }
+
+    private fun stopRemainingTimeOverlay() {
+        RemainingTimeOverlayController.hide()
+    }
+
+    private fun openTimeOverlayPermissionSettings(): Boolean {
+        return try {
+            val intent = Intent(
+                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                Uri.parse("package:$packageName")
+            ).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            startActivity(intent)
+            true
+        } catch (error: Exception) {
+            Log.w(logTag, "Unable to open overlay permission settings", error)
+            false
+        }
+    }
+
     private fun isPolicyExemptLaunchPackage(targetPackageName: String): Boolean {
-        return targetPackageName == youtubePackageName
+        return false
     }
 
     private fun resolveLaunchIntentForPackage(targetPackageName: String): Intent? {
@@ -1577,12 +1979,21 @@ class MainActivity : FlutterActivity() {
             .putBoolean(allowAppUpdatesKey, allowed)
             .apply()
 
-        applyHardKioskPolicies()
+        if (isKioskModeEnabled()) {
+            applyHardKioskPolicies()
+        } else {
+            disableKioskModeSafely()
+        }
     }
 
     private fun isAppUpdatesAllowed(): Boolean {
         return getSharedPreferences(policyPrefsName, Context.MODE_PRIVATE)
             .getBoolean(allowAppUpdatesKey, false)
+    }
+
+    private fun isKioskModeEnabled(): Boolean {
+        return getSharedPreferences(flutterPrefsName, Context.MODE_PRIVATE)
+            .getBoolean(kioskModeEnabledPrefKey, true)
     }
 
     private fun getCurrentCustomerRole(): String? {
@@ -1597,11 +2008,11 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun shouldAllowAppInstalls(): Boolean {
-        return isAppUpdatesAllowed() && isAdminSessionActive()
+        return !isKioskModeEnabled() || (isAppUpdatesAllowed() && isAdminSessionActive())
     }
 
     private fun shouldAllowPlayStoreAccess(): Boolean {
-        return isAdminSessionActive()
+        return !isKioskModeEnabled() || isAdminSessionActive()
     }
 
     private fun syncProtectedAppVisibility() {
@@ -1756,23 +2167,135 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun resetWhitelistedApps(packageNames: List<String>): List<String> {
-        return packageNames.filter { packageName ->
-            !forceStopAndClear(packageName)
+        val targets = LinkedHashSet<String>().apply {
+            packageNames
+                .map { it.trim() }
+                .filter { it.isNotEmpty() && it != this@MainActivity.packageName }
+                .forEach(::add)
+
+            val lastLaunchedAppPackage = getSharedPreferences(policyPrefsName, Context.MODE_PRIVATE)
+                .getString(lastLaunchedAppKey, null)
+                ?.trim()
+            if (!lastLaunchedAppPackage.isNullOrEmpty() &&
+                lastLaunchedAppPackage != this@MainActivity.packageName
+            ) {
+                add(lastLaunchedAppPackage)
+            }
+
+            addAll(getActiveBackgroundPackages())
         }
+
+        Log.d(logTag, "Deep freeze reset targets=${targets.joinToString(", ")}")
+
+        val failures = targets.filter { packageName ->
+            !forceStopTrackedPackage(packageName)
+        }
+
+        getSharedPreferences(policyPrefsName, Context.MODE_PRIVATE)
+            .edit()
+            .remove(lastLaunchedAppKey)
+            .apply()
+
+        return failures
     }
 
-    private fun forceStopAndClear(targetPackageName: String): Boolean {
+    private fun forceStopTrackedPackage(targetPackageName: String): Boolean {
         if (!isDeviceOwnerApp()) {
-            Log.w(logTag, "Cannot force stop and clear app $targetPackageName: Not device owner.")
+            Log.w(logTag, "Cannot force stop app $targetPackageName: Not device owner.")
             return false
         }
 
-        val forceStopCommand = "am force-stop $targetPackageName"
-        val clearCommand = "pm clear $targetPackageName"
+        val forceStopped = aggressivelyForceStopPackage(targetPackageName)
+        val resetSucceeded = forceStopped
+        Log.d(
+            logTag,
+            "Deep freeze stop package=$targetPackageName forceStopped=$forceStopped " +
+                "resetSucceeded=$resetSucceeded"
+        )
+        return resetSucceeded
+    }
 
-        val forceStopped = runShellCommand(forceStopCommand)
-        val cleared = runShellCommand(clearCommand)
-        return forceStopped && cleared // Return true only if both commands succeed
+    private fun getActiveBackgroundPackages(): Set<String> {
+        val activityManager = getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+            ?: return emptySet()
+
+        return LinkedHashSet<String>().apply {
+            activityManager.appTasks.forEach { task ->
+                task.taskInfo?.topActivity?.packageName
+                    ?.takeIf {
+                        it.isNotBlank() &&
+                            it != packageName &&
+                            it != "com.android.settings"
+                    }
+                    ?.let(::add)
+                task.taskInfo?.baseActivity?.packageName
+                    ?.takeIf {
+                        it.isNotBlank() &&
+                            it != packageName &&
+                            it != "com.android.settings"
+                    }
+                    ?.let(::add)
+            }
+
+            activityManager.runningAppProcesses?.forEach { process ->
+                process.pkgList?.forEach { processPackage ->
+                    if (processPackage.isNotBlank() &&
+                        processPackage != packageName &&
+                        processPackage != "com.android.settings"
+                    ) {
+                        add(processPackage)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun killBackgroundProcess(targetPackageName: String) {
+        val activityManager = getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+            ?: return
+        try {
+            activityManager.killBackgroundProcesses(targetPackageName)
+            Log.d(logTag, "Requested background kill for $targetPackageName")
+        } catch (error: Exception) {
+            Log.w(logTag, "Unable to kill background process for $targetPackageName", error)
+        }
+    }
+
+    private fun removeTasksForPackage(targetPackageName: String) {
+        val activityManager = getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+            ?: return
+
+        activityManager.appTasks.forEach { task ->
+            val topPackage = task.taskInfo?.topActivity?.packageName
+            val basePackage = task.taskInfo?.baseActivity?.packageName
+            if (topPackage == targetPackageName || basePackage == targetPackageName) {
+                try {
+                    task.finishAndRemoveTask()
+                    Log.d(logTag, "Removed app task for $targetPackageName")
+                } catch (error: Exception) {
+                    Log.w(logTag, "Unable to remove app task for $targetPackageName", error)
+                }
+            }
+        }
+    }
+
+    private fun aggressivelyForceStopPackage(targetPackageName: String): Boolean {
+        removeTasksForPackage(targetPackageName)
+        killBackgroundProcess(targetPackageName)
+        val firstAttempt = runShellCommand("am force-stop $targetPackageName")
+        if (firstAttempt) {
+            return true
+        }
+
+        Thread.sleep(180L)
+        removeTasksForPackage(targetPackageName)
+        killBackgroundProcess(targetPackageName)
+        val secondAttempt = runShellCommand("am force-stop $targetPackageName")
+        Log.d(
+            logTag,
+            "Aggressive close retry package=$targetPackageName firstAttempt=$firstAttempt secondAttempt=$secondAttempt"
+        )
+        return secondAttempt
     }
 
     private fun runShellCommand(command: String): Boolean {

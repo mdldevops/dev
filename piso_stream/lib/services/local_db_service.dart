@@ -29,6 +29,20 @@ class StandaloneSalesSummary {
   final int monthly;
 }
 
+class StandaloneCoinSaleLog {
+  const StandaloneCoinSaleLog({
+    required this.id,
+    required this.amount,
+    required this.minutesAdded,
+    required this.createdAt,
+  });
+
+  final int id;
+  final int amount;
+  final int minutesAdded;
+  final DateTime createdAt;
+}
+
 class LocalDbService {
   LocalDbService._();
 
@@ -207,6 +221,30 @@ class LocalDbService {
       weekly: await sumFrom(startOfWeek.millisecondsSinceEpoch),
       monthly: await sumFrom(startOfMonth.millisecondsSinceEpoch),
     );
+  }
+
+  Future<List<StandaloneCoinSaleLog>> getStandaloneSaleLogs({
+    int limit = 300,
+  }) async {
+    final db = await database;
+    final rows = await db.query(
+      'standalone_sales',
+      orderBy: 'created_at DESC',
+      limit: limit,
+    );
+
+    return rows
+        .map(
+          (row) => StandaloneCoinSaleLog(
+            id: (row['id'] as num?)?.toInt() ?? 0,
+            amount: (row['amount'] as num?)?.toInt() ?? 0,
+            minutesAdded: (row['minutes_added'] as num?)?.toInt() ?? 0,
+            createdAt: DateTime.fromMillisecondsSinceEpoch(
+              (row['created_at'] as num?)?.toInt() ?? 0,
+            ),
+          ),
+        )
+        .toList();
   }
 
   Future<void> resetStandaloneSales() async {

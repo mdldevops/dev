@@ -1,6 +1,9 @@
 import 'dart:async';
 
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:socket_io_client/socket_io_client.dart' as io;
+
+import '../app_settings.dart';
 
 class SocketService {
   SocketService._internal({
@@ -9,6 +12,11 @@ class SocketService {
   });
 
   static SocketService? _instance;
+
+  static void disconnectShared() {
+    _instance?.disconnect();
+    _instance = null;
+  }
 
   factory SocketService({
     required String url,
@@ -93,6 +101,26 @@ class SocketService {
   }
 
   void connect() {
+    if (_connecting || socket?.connected == true) {
+      return;
+    }
+
+    _guardServerModeThenConnect();
+  }
+
+  Future<void> _guardServerModeThenConnect() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (AppSettings.isStandaloneModeValue(
+      prefs.getString(AppSettings.setupModeKey),
+    )) {
+      print('Socket skipped: setup mode is standalone');
+      if (!(_connectionCompleter?.isCompleted ?? true)) {
+        _connectionCompleter!.completeError('Socket disabled in standalone mode');
+      }
+      disconnect();
+      return;
+    }
+
     if (_connecting || socket?.connected == true) {
       return;
     }
@@ -210,7 +238,16 @@ class SocketService {
       return;
     }
 
-    _reconnectTimer = Timer(const Duration(seconds: 3), () {
+    _reconnectTimer = Timer(const Duration(seconds: 3), () async {
+      final prefs = await SharedPreferences.getInstance();
+      if (AppSettings.isStandaloneModeValue(
+        prefs.getString(AppSettings.setupModeKey),
+      )) {
+        print('Socket reconnect cancelled: setup mode is standalone');
+        disconnect();
+        return;
+      }
+
       if (!_manualDisconnect) {
         connect();
       }
@@ -230,6 +267,9 @@ class SocketService {
   void disconnect() {
     _manualDisconnect = true;
     _reconnectTimer?.cancel();
+    if (!(_connectionCompleter?.isCompleted ?? true)) {
+      _connectionCompleter!.completeError('Socket disconnected');
+    }
     socket?.disconnect();
     socket?.dispose();
     socket = null;

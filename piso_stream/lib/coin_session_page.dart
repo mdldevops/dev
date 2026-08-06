@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:piso_stream/controller/kiosk_controller.dart';
 import 'package:piso_stream/device_status_bar.dart';
 import 'package:piso_stream/services/api_service.dart';
@@ -44,15 +45,19 @@ class CoinSessionPage extends StatefulWidget {
   State<CoinSessionPage> createState() => _CoinSessionPageState();
 }
 
-class _CoinSessionPageState extends State<CoinSessionPage> {
+class _CoinSessionPageState extends State<CoinSessionPage>
+    with WidgetsBindingObserver {
+  static const MethodChannel _channel = MethodChannel(
+    'com.example.piso_stream/installed_apps',
+  );
   static const int _defaultCountdownSeconds = 60;
+  static const int _cancelDelaySeconds = 3;
 
   late int _remainingSeconds;
   late Duration _selectedTime;
   bool _showStartPlaying = false;
   bool _sessionActive = false;
   bool _connectionError = false;
-  String _errorMessage = '';
   Timer? _timer;
   bool _isClosing = false;
   bool _isCancelling = false;
@@ -67,22 +72,29 @@ class _CoinSessionPageState extends State<CoinSessionPage> {
   bool _coinAudioEnabled = false;
   String? _coinAudioPath;
   bool _isStandaloneMode = false;
+  bool _cancelDelayActive = true;
+  Timer? _cancelDelayTimer;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _audioService = AudioService();
     _remainingSeconds = _defaultCountdownSeconds;
     _selectedTime = widget.initialSelectedTime;
     _showStartPlaying = _selectedTime > Duration.zero;
     _startCountdown();
+    _startCancelDelay();
 
     _initializeKiosk();
+    _refreshChargingMonitor();
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _timer?.cancel();
+    _cancelDelayTimer?.cancel();
     _audioService.stopAudio();
     if (!_isClosing) {
       kiosk.dispose();
@@ -91,12 +103,61 @@ class _CoinSessionPageState extends State<CoinSessionPage> {
     super.dispose();
   }
 
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _refreshChargingMonitor();
+    }
+  }
+
+  Future<void> _refreshChargingMonitor() async {
+    try {
+      debugPrint('[ChargingMonitor][coin] requesting refresh');
+      final result = await _channel.invokeMapMethod<String, dynamic>(
+        'refreshChargingMonitor',
+        {
+          'resetDecisionCache': false,
+        },
+      );
+      debugPrint(
+        '[ChargingMonitor][coin] result=${result ?? <String, dynamic>{}}',
+      );
+    } on PlatformException catch (error) {
+      debugPrint('[ChargingMonitor][coin] failed: ${error.message}');
+    }
+  }
+
+  void _startCancelDelay() {
+    _cancelDelayTimer?.cancel();
+    _cancelDelayActive = true;
+    _cancelDelayTimer = Timer(
+      const Duration(seconds: _cancelDelaySeconds),
+      () {
+        if (!mounted) {
+          return;
+        }
+        setState(() {
+          _cancelDelayActive = false;
+        });
+      },
+    );
+  }
+
   Future<void> _disposeKiosk({bool releaseSession = false}) async {
     if (_isClosing) {
       return;
     }
 
     _isClosing = true;
+
+    if (releaseSession && _isStandaloneMode) {
+      try {
+        await kiosk.endSession();
+      } catch (error) {
+        debugPrint('Standalone end session during dispose failed: $error');
+      }
+      return;
+    }
 
     if (releaseSession && !_isStandaloneMode) {
       try {
@@ -208,9 +269,6 @@ class _CoinSessionPageState extends State<CoinSessionPage> {
           _diagnosticMessage = _socketConnected
               ? 'Session active. Waiting for coin events.'
               : 'Session active. Socket is reconnecting.';
-          if (!_connectionError) {
-            _errorMessage = '';
-          }
         });
       };
 
@@ -234,7 +292,6 @@ class _CoinSessionPageState extends State<CoinSessionPage> {
           // Don't show error notification - socket will auto-reconnect
           if (!_sessionActive) {
             _connectionError = false;
-            _errorMessage = '';
           }
         });
       };
@@ -256,20 +313,17 @@ class _CoinSessionPageState extends State<CoinSessionPage> {
                 'Session active. Waiting for socket reconnection...';
             // Don't show error message for reconnection warnings
             _connectionError = false;
-            _errorMessage = '';
             return;
           }
 
           // Only show errors if not a socket reconnection warning
           if (!isSocketReconnectWarning && _sessionActive) {
             _connectionError = false;
-            _errorMessage = '';
             _diagnosticMessage = 'Session active. Coins are being monitored.';
             return;
           }
 
           _connectionError = true;
-          _errorMessage = error;
           _diagnosticMessage = error;
         });
       };
@@ -302,14 +356,13 @@ class _CoinSessionPageState extends State<CoinSessionPage> {
       setState(() {
         _isInitializingKiosk = false;
         _connectionError = true;
-        _errorMessage = 'Failed to initialize device session: $error';
         _diagnosticMessage = 'Session initialization failed.';
       });
     }
   }
 
   Future<void> _cancelAndExit() async {
-    if (_isCancelling) {
+    if (_isCancelling || _cancelDelayActive) {
       return;
     }
 
@@ -399,12 +452,14 @@ class _CoinSessionPageState extends State<CoinSessionPage> {
 
   void _addTime(Duration duration) {
     AppSettings.clearPendingReset();
+    _cancelDelayTimer?.cancel();
 
     setState(() {
       // Always accumulate time - whether before or during active session
       _selectedTime = _selectedTime + duration;
       _remainingSeconds = _defaultCountdownSeconds;
       _showStartPlaying = _selectedTime > Duration.zero;
+      _cancelDelayActive = false;
     });
     _startCountdown();
   }
@@ -630,7 +685,7 @@ class _CoinSessionPageState extends State<CoinSessionPage> {
                     SizedBox(
                       width: double.infinity,
                       child: OutlinedButton(
-                        onPressed: _isCancelling
+                        onPressed: _isCancelling || _cancelDelayActive
                             ? null
                             : () async {
                                 if (_sessionActive &&
@@ -648,7 +703,11 @@ class _CoinSessionPageState extends State<CoinSessionPage> {
                           padding: const EdgeInsets.symmetric(vertical: 13),
                         ),
                         child: Text(
-                          _isCancelling ? 'Cancelling...' : 'Cancel',
+                          _isCancelling
+                              ? 'Cancelling...'
+                              : _cancelDelayActive
+                              ? 'Cancel (${_cancelDelaySeconds}s)'
+                              : 'Cancel',
                           style: const TextStyle(
                             fontSize: 16,
                             fontWeight: FontWeight.w700,
@@ -656,6 +715,18 @@ class _CoinSessionPageState extends State<CoinSessionPage> {
                         ),
                       ),
                     ),
+                  if (_cancelDelayActive) ...[
+                    const SizedBox(height: 8),
+                    const Text(
+                      'Cancel unlocks after a short delay to avoid accidental exit.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: Colors.white60,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ],
                 ],
               ),
             ),
@@ -721,84 +792,7 @@ class _CountdownRing extends StatelessWidget {
       ),
     );
   }
-}
 
-class _SessionDiagnosticBar extends StatelessWidget {
-  const _SessionDiagnosticBar({
-    required this.socketConnected,
-    required this.sessionActive,
-    required this.message,
-  });
-
-  final bool socketConnected;
-  final bool sessionActive;
-  final String message;
-
-  @override
-  Widget build(BuildContext context) {
-    final indicatorColor = socketConnected
-        ? Colors.greenAccent
-        : sessionActive
-        ? Colors.orangeAccent
-        : Colors.white70;
-
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-      decoration: BoxDecoration(
-        color: Colors.black.withValues(alpha: 0.24),
-        border: Border.all(color: Colors.white12),
-        borderRadius: BorderRadius.circular(10),
-      ),
-      child: Row(
-        children: [
-          Container(
-            width: 10,
-            height: 10,
-            decoration: BoxDecoration(
-              color: indicatorColor,
-              shape: BoxShape.circle,
-            ),
-          ),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Text(
-              message,
-              style: const TextStyle(
-                color: Colors.white70,
-                fontSize: 12,
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _TimeAddButton extends StatelessWidget {
-  const _TimeAddButton({required this.label, required this.onTap});
-
-  final String label;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    return ElevatedButton(
-      onPressed: onTap,
-      style: ElevatedButton.styleFrom(
-        backgroundColor: Colors.white.withValues(alpha: 0.12),
-        foregroundColor: Colors.white,
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-      ),
-      child: Text(
-        label,
-        style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w700),
-      ),
-    );
-  }
 }
 
 class _SessionBackground extends StatelessWidget {

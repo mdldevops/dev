@@ -23,6 +23,7 @@ class KioskController {
   bool isActive = false;
   bool isConnected = false;
   bool _isStandaloneMode = false;
+  bool _backgroundServicesEnabled = true;
   Timer? _sessionStatePoller;
   Timer? _standaloneHeartbeatTimer;
   bool _isSyncingSessionState = false;
@@ -90,6 +91,9 @@ class KioskController {
 
   void _startSessionStatePolling() {
     _sessionStatePoller?.cancel();
+    if (!_backgroundServicesEnabled) {
+      return;
+    }
     // Poll more frequently (every 500ms) to catch coin insertions quickly
     _sessionStatePoller = Timer.periodic(const Duration(milliseconds: 500), (
       _,
@@ -102,6 +106,8 @@ class KioskController {
     final prefs = await SharedPreferences.getInstance();
     final setupMode = prefs.getString(AppSettings.setupModeKey);
     _isStandaloneMode = AppSettings.isStandaloneModeValue(setupMode);
+    _backgroundServicesEnabled =
+        prefs.getBool(AppSettings.backgroundServicesEnabledKey) ?? true;
 
     if (_isStandaloneMode) {
       await _initializeStandalone();
@@ -399,6 +405,9 @@ class KioskController {
 
   void _startStandaloneHeartbeat() {
     _standaloneHeartbeatTimer?.cancel();
+    if (!_backgroundServicesEnabled) {
+      return;
+    }
     _standaloneHeartbeatTimer = Timer.periodic(
       const Duration(seconds: 20),
       (_) {

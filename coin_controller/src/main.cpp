@@ -8,13 +8,13 @@
 const char* ssid = "Loading...";
 const char* password = "MdlJcrZfrlZvrl11@2.4G";
 
-const IPAddress localIp(192, 168, 1, 3);
+const IPAddress localIp(192, 168, 1, 6);
 const IPAddress gateway(192, 168, 1, 1);
 const IPAddress subnet(255, 255, 255, 0);
 const IPAddress dnsServer(8, 8, 8, 8);
 
 const int websocketPort = 81;
-const int coinPin = 14;
+const int coinPin = 25;
 const int acceptorEnablePin = 26;
 const bool acceptorEnabledLevel = HIGH;
 const unsigned long acceptorOpenDelayMs = 100;
@@ -171,6 +171,8 @@ void broadcastStatusEvent(
   }
 }
 
+void publishPendingCoinCredit(bool isRetry = false);
+
 void openSessionForLauncher(
   uint8_t clientNum,
   const String& launcherId,
@@ -194,6 +196,14 @@ void openSessionForLauncher(
     "open_session_ack",
     "Coin controller is ready."
   );
+
+  if (hasPendingCoinAck && pendingCoinEventId.length() > 0) {
+    Serial.println(
+      String("[CoinController WS] Re-sending pending coin credit for launcherId=") +
+      launcherId + " eventId=" + pendingCoinEventId
+    );
+    publishPendingCoinCredit(true);
+  }
 }
 
 void closeCurrentSession(const String& message) {
@@ -228,6 +238,21 @@ void closeCurrentSession(const String& message) {
   broadcastStatusEvent("close_session_ack", message);
 }
 
+void pauseSessionPreservingPendingCredit(const String& message) {
+  acceptorOpenPending = false;
+  setAcceptorOutput(false);
+  refreshOwnerLease();
+
+  Serial.println(
+    "[CoinController WS] Pausing session while preserving pending credit. message=" +
+    message +
+    " activeLauncherDeviceId=" + activeLauncherDeviceId +
+    " pendingCoinEventId=" + pendingCoinEventId
+  );
+
+  broadcastStatusEvent("close_session_ack", message);
+}
+
 String nextCoinEventId() {
   lastCoinEventId++;
   return controllerId + "_" + String(lastCoinEventId);
@@ -248,7 +273,7 @@ String buildCoinPayload(int amount, const String& eventId) {
   return payload;
 }
 
-void publishPendingCoinCredit(bool isRetry = false) {
+void publishPendingCoinCredit(bool isRetry) {
   if (pendingCoinAmount <= 0 || pendingCoinEventId.length() == 0) {
     return;
   }
@@ -400,7 +425,13 @@ void handleCommandPayload(uint8_t clientNum, const String& payload) {
 
     if (activeLauncherDeviceId.length() == 0 ||
         activeLauncherDeviceId == launcherId) {
-      closeCurrentSession("Coin controller session closed.");
+      if (hasPendingCoinAck && activeLauncherDeviceId == launcherId) {
+        pauseSessionPreservingPendingCredit(
+          "Coin controller paused. Pending credit will be restored for this device."
+        );
+      } else {
+        closeCurrentSession("Coin controller session closed.");
+      }
     } else {
       sendStatusEventToClient(
         clientNum,

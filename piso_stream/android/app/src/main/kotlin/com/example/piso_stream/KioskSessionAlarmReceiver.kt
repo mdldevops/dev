@@ -320,7 +320,7 @@ class KioskSessionAlarmReceiver : BroadcastReceiver() {
         val closeResults = targetPackages.map { targetPackage ->
             val suspendedByPolicy = temporarilySuspendAndRestorePackage(context, targetPackage)
             val hiddenByPolicy = temporarilyHideAndRestorePackage(context, targetPackage)
-            val forceStopped = runShellCommand("am force-stop $targetPackage")
+            val forceStopped = aggressivelyForceStopPackage(context, targetPackage)
             closeApplied = closeApplied || suspendedByPolicy || hiddenByPolicy || forceStopped
             "$targetPackage[suspend=$suspendedByPolicy hide=$hiddenByPolicy force=$forceStopped]"
         }
@@ -399,6 +399,54 @@ class KioskSessionAlarmReceiver : BroadcastReceiver() {
                 "Failed to revoke lock-task allowlist: ${error.message}"
             )
             false
+        }
+    }
+
+    private fun aggressivelyForceStopPackage(context: Context, targetPackage: String): Boolean {
+        removeTasksForPackage(context, targetPackage)
+        killBackgroundProcess(context, targetPackage)
+        val firstAttempt = runShellCommand("am force-stop $targetPackage")
+        if (firstAttempt) {
+            return true
+        }
+
+        Thread.sleep(180L)
+        removeTasksForPackage(context, targetPackage)
+        killBackgroundProcess(context, targetPackage)
+        val secondAttempt = runShellCommand("am force-stop $targetPackage")
+        Log.d(
+            logTag,
+            "Aggressive close retry package=$targetPackage firstAttempt=$firstAttempt secondAttempt=$secondAttempt"
+        )
+        return secondAttempt
+    }
+
+    private fun removeTasksForPackage(context: Context, targetPackage: String) {
+        val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+            ?: return
+
+        activityManager.appTasks.forEach { task ->
+            val topPackage = task.taskInfo?.topActivity?.packageName
+            val basePackage = task.taskInfo?.baseActivity?.packageName
+            if (topPackage == targetPackage || basePackage == targetPackage) {
+                try {
+                    task.finishAndRemoveTask()
+                    Log.d(logTag, "Removed app task for $targetPackage")
+                } catch (error: Exception) {
+                    Log.w(logTag, "Unable to remove app task for $targetPackage", error)
+                }
+            }
+        }
+    }
+
+    private fun killBackgroundProcess(context: Context, targetPackage: String) {
+        val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+            ?: return
+        try {
+            activityManager.killBackgroundProcesses(targetPackage)
+            Log.d(logTag, "Requested background kill for $targetPackage")
+        } catch (error: Exception) {
+            Log.w(logTag, "Unable to kill background process for $targetPackage", error)
         }
     }
 

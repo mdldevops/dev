@@ -38,6 +38,9 @@ class KioskRestartReceiver : BroadcastReceiver() {
         val alarmManager = context.getSystemService(AlarmManager::class.java) ?: return
         val triggerAt = System.currentTimeMillis() + 3000
 
+        ChargingMonitorReceiver.scheduleNext(context, 5000L)
+        ChargingMonitorService.start(context)
+
         alarmManager.setExactAndAllowWhileIdle(
             AlarmManager.RTC_WAKEUP,
             triggerAt,

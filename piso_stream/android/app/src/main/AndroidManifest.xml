@@ -4,8 +4,11 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
@@ -46,6 +49,17 @@
             android:enabled="true"
             android:directBootAware="true"
             android:exported="false" />
+        <receiver
+            android:name=".ChargingMonitorReceiver"
+            android:enabled="true"
+            android:directBootAware="true"
+            android:exported="false" />
+        <service
+            android:name=".ChargingMonitorService"
+            android:enabled="true"
+            android:directBootAware="true"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
         <activity 
             android:name=".MainActivity"
             android:exported="true"

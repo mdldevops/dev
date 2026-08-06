@@ -10,9 +10,11 @@ import 'admin_login.dart';
 import 'coin_session_page.dart';
 import 'customer_auth_page.dart';
 import 'device_status_bar.dart';
+import 'media_wallpaper_background.dart';
 import 'services/customer_account_service.dart';
 import 'services/device_identity_service.dart';
 import 'services/ble_charger_service.dart';
+import 'services/shelly_charger_service.dart';
 import 'services/standalone_mqtt_service.dart';
 import 'services/socket_service.dart';
 import 'services/api_service.dart';
@@ -61,6 +63,7 @@ class _MyAppState extends State<MyApp> {
       _sharedSocket?.removeBroadcastListener(_showBroadcastPopup);
       _sharedSocket?.disconnect();
       _sharedSocket = null;
+      SocketService.disconnectShared();
       return;
     }
 
@@ -163,6 +166,7 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
   Timer? _deviceStateTimer;
   String? _deviceId;
   bool _isStartingCoinSession = false;
+  bool _backgroundServicesEnabled = true;
 
   bool get _isStandaloneMode =>
       AppSettings.isStandaloneModeValue(_setupMode);
@@ -203,6 +207,7 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
 
   @override
   void didPopNext() {
+    _refreshChargingMonitor();
     _loadSavedSettings();
   }
 
@@ -214,8 +219,26 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
+      _refreshChargingMonitor();
       _enableKioskMode();
       _loadSavedSettings();
+    }
+  }
+
+  Future<void> _refreshChargingMonitor() async {
+    try {
+      debugPrint('[ChargingMonitor][main] requesting refresh');
+      final result = await _platformChannel.invokeMapMethod<String, dynamic>(
+        'refreshChargingMonitor',
+        {
+          'resetDecisionCache': false,
+        },
+      );
+      debugPrint(
+        '[ChargingMonitor][main] result=${result ?? <String, dynamic>{}}',
+      );
+    } on PlatformException catch (error) {
+      debugPrint('[ChargingMonitor][main] failed: ${error.message}');
     }
   }
 
@@ -250,11 +273,16 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
     final setupMode =
         prefs.getString(AppSettings.setupModeKey) ??
         AppSettings.setupModeServer;
+    if (AppSettings.isStandaloneModeValue(setupMode)) {
+      SocketService.disconnectShared();
+    }
     final gracePeriodLabel =
         prefs.getString(AppSettings.gracePeriodKey) ??
         AppSettings.defaultGracePeriodLabel;
     final isDeepFreezeEnabled =
         prefs.getBool(AppSettings.deepFreezeEnabledKey) ?? false;
+    final backgroundServicesEnabled =
+        prefs.getBool(AppSettings.backgroundServicesEnabledKey) ?? true;
     String? currentCustomer = prefs
         .getString(AppSettings.currentCustomerKey)
         ?.trim();
@@ -321,6 +349,7 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
           : savedLandscapeWallpaper;
       _gracePeriodLabel = gracePeriodLabel;
       _isDeepFreezeEnabled = isDeepFreezeEnabled;
+      _backgroundServicesEnabled = backgroundServicesEnabled;
       _currentCustomerUsername =
           (currentCustomer == null || currentCustomer.isEmpty)
           ? null
@@ -354,6 +383,11 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
 
     _startResetWatcher();
     await _startCustomerIdleTimer();
+    if (!_backgroundServicesEnabled) {
+      _deviceStateTimer?.cancel();
+      _deviceLockTimer?.cancel();
+      return;
+    }
     if (_isStandaloneMode) {
       _deviceStateTimer?.cancel();
       _deviceLockTimer?.cancel();
@@ -370,7 +404,7 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
   }
 
   Future<void> _initializeDeviceStateSync() async {
-    if (_isStandaloneMode) {
+    if (_isStandaloneMode || !_backgroundServicesEnabled) {
       _deviceStateTimer?.cancel();
       return;
     }
@@ -395,7 +429,7 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
   }
 
   Future<void> _syncDeviceState() async {
-    if (_isStandaloneMode) {
+    if (_isStandaloneMode || !_backgroundServicesEnabled) {
       return;
     }
 
@@ -418,18 +452,40 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
         : 0;
     final batteryLevel = await _getBatteryLevel();
     final chargerStartPercent =
-        prefs.getInt(AppSettings.chargerStartPercentKey) ?? 30;
+        prefs.getInt(AppSettings.chargerStartPercentKey) ?? 20;
     final chargerStopPercent =
         prefs.getInt(AppSettings.chargerStopPercentKey) ?? 80;
-    if (batteryLevel != null) {
-      await BleChargerService.instance.syncChargingDecision(
-        batteryLevel: batteryLevel,
-        startBelowPercent: chargerStartPercent,
-        stopAtPercent: chargerStopPercent,
-        relayPin: _chargerRelayPin ?? 26,
-        launcherDeviceId: deviceId,
-        launcherDeviceName: _deviceName,
-      );
+    final chargerControlMode =
+        prefs.getString(AppSettings.chargerControlModeKey) ??
+        AppSettings.chargerControlModeBle;
+    final chargingControlEnabled =
+        prefs.getBool(AppSettings.chargingControlEnabledKey) ?? true;
+    if (batteryLevel != null && chargingControlEnabled) {
+      if (chargerControlMode == AppSettings.chargerControlModeShelly) {
+        await ShellyChargerService.instance.syncChargingDecision(
+          batteryLevel: batteryLevel,
+          startBelowPercent: chargerStartPercent,
+          stopAtPercent: chargerStopPercent,
+          onUrl: prefs.getString(AppSettings.shellyChargeOnUrlKey) ?? '',
+          offUrl: prefs.getString(AppSettings.shellyChargeOffUrlKey) ?? '',
+          useToggle: prefs.getBool(AppSettings.shellyUseToggleKey) ?? false,
+          toggleUrl:
+              prefs.getString(AppSettings.shellyToggleUrlKey) ??
+              AppSettings.defaultShellyToggleUrl,
+          useAuth: prefs.getBool(AppSettings.shellyUseAuthKey) ?? false,
+          username: prefs.getString(AppSettings.shellyUsernameKey) ?? '',
+          password: prefs.getString(AppSettings.shellyPasswordKey) ?? '',
+        );
+      } else {
+        await BleChargerService.instance.syncChargingDecision(
+          batteryLevel: batteryLevel,
+          startBelowPercent: chargerStartPercent,
+          stopAtPercent: chargerStopPercent,
+          relayPin: _chargerRelayPin ?? 26,
+          launcherDeviceId: deviceId,
+          launcherDeviceName: _deviceName,
+        );
+      }
     }
     await ApiService.updateDeviceState(
       deviceId: deviceId,
@@ -444,6 +500,10 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
   }
 
   void _startDeviceLockWatcher() {
+    if (!_backgroundServicesEnabled) {
+      _deviceLockTimer?.cancel();
+      return;
+    }
     _deviceLockTimer?.cancel();
     _deviceLockTimer = Timer.periodic(const Duration(seconds: 5), (_) {
       _refreshDeviceLockStatus();
@@ -451,7 +511,7 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
   }
 
   Future<void> _refreshDeviceLockStatus() async {
-    if (_isStandaloneMode) {
+    if (_isStandaloneMode || !_backgroundServicesEnabled) {
       return;
     }
 
@@ -472,7 +532,9 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
   void _startResetWatcher() {
     _resetTimer?.cancel();
 
-    if (!_isDeepFreezeEnabled || _pendingResetRemaining == null) {
+    if (!_backgroundServicesEnabled ||
+        !_isDeepFreezeEnabled ||
+        _pendingResetRemaining == null) {
       return;
     }
 
@@ -698,6 +760,10 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
 
   Future<void> _startCustomerIdleTimer() async {
     _customerIdleTimer?.cancel();
+
+    if (!_backgroundServicesEnabled) {
+      return;
+    }
 
     if (_currentCustomerUsername == null) {
       return;
@@ -930,38 +996,11 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
       body: Stack(
         children: [
           Positioned.fill(
-            child: wallpaperPath == null
-                ? Container(
-                    decoration: BoxDecoration(
-                      gradient: LinearGradient(
-                        begin: Alignment.topCenter,
-                        end: Alignment.bottomCenter,
-                        colors: themeProvider.currentTheme,
-                      ),
-                    ),
-                  )
-                : Stack(
-                    fit: StackFit.expand,
-                    children: [
-                      Image.file(
-                        File(wallpaperPath),
-                        fit: BoxFit.cover,
-                        gaplessPlayback: true,
-                        errorBuilder: (_, _, _) {
-                          return Container(
-                            decoration: BoxDecoration(
-                              gradient: LinearGradient(
-                                begin: Alignment.topCenter,
-                                end: Alignment.bottomCenter,
-                                colors: themeProvider.currentTheme,
-                              ),
-                            ),
-                          );
-                        },
-                      ),
-                      Container(color: Colors.black.withValues(alpha: 0.28)),
-                    ],
-                  ),
+            child: MediaWallpaperBackground(
+              path: wallpaperPath,
+              gradientColors: themeProvider.currentTheme,
+              overlayOpacity: 0.28,
+            ),
           ),
           const Positioned.fill(child: _ArcadeGrid()),
           const Positioned.fill(child: _NeonGlow()),

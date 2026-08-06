@@ -61,6 +61,11 @@ class BleChargerService {
 
   bool get isConnected => _device != null && _commandCharacteristic != null;
 
+  void resetChargingDecisionCache() {
+    _hasRelayState = false;
+    _lastRelayEnabled = false;
+  }
+
   Future<void> startScan({String? namePrefix}) async {
     await _scanSubscription?.cancel();
     _scanSubscription = FlutterBluePlus.scanResults.listen((results) {

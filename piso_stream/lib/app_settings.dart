@@ -9,6 +9,9 @@ class AppSettings {
   static const String landscapeWallpaperKey = 'landscape_wallpaper_path';
   static const String allowedAppsKey = 'allowed_app_packages';
   static const String deepFreezeEnabledKey = 'deep_freeze_enabled';
+  static const String kioskModeEnabledKey = 'kiosk_mode_enabled';
+  static const String backgroundServicesEnabledKey =
+      'background_services_enabled';
   static const String allowAppUpdatesKey = 'allow_app_updates';
   static const String gracePeriodKey = 'grace_period';
   static const String pendingResetAtKey = 'pending_reset_at';
@@ -21,6 +24,7 @@ class AppSettings {
   static const String localAdminUsernameKey = 'local_admin_username';
   static const String localAdminPasswordKey = 'local_admin_password';
   static const String localAdminRoleKey = 'local_admin_role';
+  static const String localAdminPinKey = 'local_admin_pin';
   static const String audioEnabledKey = 'audio_enabled';
   static const String audioPathKey = 'audio_path';
   static const String audioLoopKey = 'audio_loop';
@@ -33,14 +37,31 @@ class AppSettings {
   static const String lowTimeAlertsVibrationEnabledKey =
       'low_time_alerts_vibration_enabled';
   static const String chargerRelayPinKey = 'charger_relay_pin';
+  static const String chargingControlEnabledKey = 'charging_control_enabled';
+  static const String chargerControlModeKey = 'charger_control_mode';
   static const String chargerBleDeviceNameKey = 'charger_ble_device_name';
   static const String chargerStartPercentKey = 'charger_start_percent';
   static const String chargerStopPercentKey = 'charger_stop_percent';
+  static const String shellyChargeOnUrlKey = 'shelly_charge_on_url';
+  static const String shellyChargeOffUrlKey = 'shelly_charge_off_url';
+  static const String shellyUseToggleKey = 'shelly_use_toggle';
+  static const String shellyToggleUrlKey = 'shelly_toggle_url';
+  static const String shellyUseAuthKey = 'shelly_use_auth';
+  static const String shellyUsernameKey = 'shelly_username';
+  static const String shellyPasswordKey = 'shelly_password';
   static const String sessionExpiredPendingKey = 'session_expired_pending';
   static const String nativeCloseDebugKey = 'native_close_debug';
   static const String defaultGracePeriodLabel = '1 minute';
   static const String defaultStandaloneControllerIp = '192.168.1.3';
   static const String defaultChargerBleNamePrefix = 'PisoCharger';
+  static const String defaultShellyOnUrl =
+      'http://192.168.1.4/relay/0?turn=on';
+  static const String defaultShellyOffUrl =
+      'http://192.168.1.4/relay/0?turn=off';
+  static const String defaultShellyToggleUrl =
+      'http://192.168.1.4/relay/1?turn=toggle';
+  static const String chargerControlModeBle = 'ble';
+  static const String chargerControlModeShelly = 'shelly';
   static const String setupModeServer = 'server';
   static const String setupModeStandalone = 'standalone';
 
