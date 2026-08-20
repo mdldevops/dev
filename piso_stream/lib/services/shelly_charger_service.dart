@@ -16,6 +16,44 @@ class ShellyChargerService {
     _lastRelayEnabled = false;
   }
 
+  Future<bool> sendManualCommand({
+    required String url,
+    required bool useAuth,
+    required String username,
+    required String password,
+  }) async {
+    final normalizedUrl = url.trim();
+    if (normalizedUrl.isEmpty) {
+      debugPrint('[ShellyChargerService] manual command skipped missing URL');
+      return false;
+    }
+
+    try {
+      debugPrint('[ShellyChargerService] manual command url=$normalizedUrl');
+      final response = await http
+          .get(
+            Uri.parse(normalizedUrl),
+            headers: _buildHeaders(
+              useAuth: useAuth,
+              username: username,
+              password: password,
+            ),
+          )
+          .timeout(const Duration(seconds: 8));
+
+      final success = response.statusCode >= 200 && response.statusCode < 300;
+      debugPrint(
+        '[ShellyChargerService] manual command '
+        '${success ? 'success' : 'failed'} code=${response.statusCode} '
+        'body=${response.body}',
+      );
+      return success;
+    } catch (error) {
+      debugPrint('[ShellyChargerService] manual command error: $error');
+      return false;
+    }
+  }
+
   Future<bool> syncChargingDecision({
     required int batteryLevel,
     required int startBelowPercent,

@@ -18,6 +18,7 @@ import 'services/local_db_service.dart';
 import 'services/shelly_charger_service.dart';
 import 'services/socket_service.dart';
 import 'services/standalone_mqtt_service.dart';
+import 'services/update_service.dart';
 import 'theme_provider.dart';
 
 class SettingsPage extends StatefulWidget {
@@ -31,12 +32,17 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
   static const MethodChannel _platformChannel = MethodChannel(
     'com.example.piso_stream/installed_apps',
   );
+  static const MethodChannel _updateChannel = MethodChannel(
+    'pisostream/app_update',
+  );
 
   // State for toggles and values
   bool isDeepFreezeEnabled = false;
   bool _kioskModeEnabled = true;
   bool _backgroundServicesEnabled = true;
   String _setupMode = AppSettings.setupModeServer;
+  String _controllerCommunicationMode =
+      AppSettings.controllerCommunicationModeSocket;
   String gracePeriod = AppSettings.defaultGracePeriodLabel;
   final TextEditingController _businessNameController = TextEditingController();
   final TextEditingController _deviceNameController = TextEditingController();
@@ -117,6 +123,10 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
   bool _timeOverlayPermissionGranted = false;
   StreamSubscription<Map<String, dynamic>>?
       _coinControllerMessageSubscription;
+  bool _isCheckingForUpdates = false;
+  bool _isInstallingUpdate = false;
+  double? _updateDownloadProgress;
+  bool _isTestingShellyCommand = false;
   final TextEditingController _chargeStartController = TextEditingController(
     text: '20',
   );
@@ -205,6 +215,9 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
       _standaloneControllerIpController.text =
           prefs.getString(AppSettings.standaloneControllerIpKey) ??
           AppSettings.defaultStandaloneControllerIp;
+      _controllerCommunicationMode =
+          prefs.getString(AppSettings.controllerCommunicationModeKey) ??
+          AppSettings.controllerCommunicationModeSocket;
       _portraitWallpaperPath = _normalizeWallpaperPath(
         prefs.getString(AppSettings.portraitWallpaperKey),
       );
@@ -325,6 +338,48 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
     } on PlatformException {
       return null;
     }
+  }
+
+  Future<void> _testShellyCommand({
+    required String label,
+    required String url,
+  }) async {
+    final trimmedUrl = url.trim();
+    if (trimmedUrl.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Enter the Shelly $label URL first.')),
+      );
+      return;
+    }
+
+    setState(() {
+      _isTestingShellyCommand = true;
+    });
+
+    final success = await ShellyChargerService.instance.sendManualCommand(
+      url: trimmedUrl,
+      useAuth: _shellyUseAuth,
+      username: _shellyUsernameController.text.trim(),
+      password: _shellyPasswordController.text,
+    );
+
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _isTestingShellyCommand = false;
+    });
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          success
+              ? 'Shelly $label command sent successfully.'
+              : 'Shelly $label command failed. Check the URL, WiFi, and auth.',
+        ),
+      ),
+    );
   }
 
   Future<void> _openTimeOverlayPermissionSettings() async {
@@ -611,6 +666,10 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
       _standaloneControllerIpController.text.trim().isEmpty
           ? AppSettings.defaultStandaloneControllerIp
           : _standaloneControllerIpController.text.trim(),
+    );
+    await prefs.setString(
+      AppSettings.controllerCommunicationModeKey,
+      _controllerCommunicationMode,
     );
     await prefs.setString(
       AppSettings.deviceNameKey,
@@ -964,9 +1023,16 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
       if (!mounted) {
         return;
       }
+      final savedAddress =
+          StandaloneMqttService.instance.connectedHost ??
+          _standaloneControllerIpController.text.trim();
+      final resolvedAddress = StandaloneMqttService.instance.resolvedHost;
       setState(() {
         _coinControllerStatus = connected
-            ? 'Connected to coin controller at ${StandaloneMqttService.instance.connectedHost ?? _standaloneControllerIpController.text.trim()}'
+            ? resolvedAddress == null || resolvedAddress == savedAddress
+                  ? 'Connected to coin controller at $savedAddress'
+                  : 'Connected to coin controller at '
+                        '$savedAddress ($resolvedAddress)'
             : 'Unable to connect to the coin controller';
       });
     } catch (error) {
@@ -1267,6 +1333,348 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
     }
   }
 
+  Future<void> _checkForUpdates() async {
+    if (_isCheckingForUpdates || _isInstallingUpdate) {
+      return;
+    }
+
+    setState(() {
+      _isCheckingForUpdates = true;
+    });
+
+    _showBlockingProgressDialog(
+      title: 'Checking for Updates',
+      message: 'Connecting to GitHub...',
+    );
+
+    try {
+      final updateInfo = await UpdateService.instance.checkForUpdate();
+      if (!mounted) {
+        return;
+      }
+      Navigator.of(context, rootNavigator: true).pop();
+
+      if (!updateInfo.updateAvailable) {
+        await _showNoUpdateDialog(updateInfo);
+        return;
+      }
+
+      await _showUpdateAvailableDialog(updateInfo);
+    } on UpdateServiceException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      Navigator.of(context, rootNavigator: true).pop();
+      await _showUpdateErrorDialog(error.message);
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      Navigator.of(context, rootNavigator: true).pop();
+      await _showUpdateErrorDialog(
+        'Unable to check for updates. Please connect to the Internet and try again.',
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isCheckingForUpdates = false;
+        });
+      } else {
+        _isCheckingForUpdates = false;
+      }
+    }
+  }
+
+  void _showBlockingProgressDialog({
+    required String title,
+    required String message,
+    double? progress,
+  }) {
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) {
+        return AlertDialog(
+          backgroundColor: const Color(0xFF121212),
+          title: Text(title, style: const TextStyle(color: Colors.white)),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Text(message, style: const TextStyle(color: Colors.white70)),
+              const SizedBox(height: 16),
+              if (progress == null)
+                const LinearProgressIndicator()
+              else ...[
+                LinearProgressIndicator(value: progress),
+                const SizedBox(height: 8),
+                Text(
+                  '${(progress * 100).round()}%',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Colors.white70),
+                ),
+              ],
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Future<void> _showNoUpdateDialog(AppUpdateInfo updateInfo) async {
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          backgroundColor: const Color(0xFF121212),
+          title: const Text(
+            'No Update Available',
+            style: TextStyle(color: Colors.white),
+          ),
+          content: Text(
+            'You are using the latest version.\n\nCurrent version: ${updateInfo.currentVersion}',
+            style: const TextStyle(color: Colors.white70),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('OK'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Future<void> _showUpdateAvailableDialog(AppUpdateInfo updateInfo) async {
+    final shouldUpdate = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          backgroundColor: const Color(0xFF121212),
+          title: const Text(
+            'Update Available',
+            style: TextStyle(color: Colors.white),
+          ),
+          content: SingleChildScrollView(
+            child: Text(
+              'Current version: ${updateInfo.currentVersion}\n'
+              'New version: ${updateInfo.latestVersion}\n\n'
+              'Release Notes:\n'
+              '${updateInfo.releaseNotes.isEmpty ? 'No release notes provided.' : updateInfo.releaseNotes}',
+              style: const TextStyle(color: Colors.white70),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(false),
+              child: const Text('LATER'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(dialogContext).pop(true),
+              child: const Text('UPDATE'),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (shouldUpdate == true) {
+      await _downloadAndInstallUpdate(updateInfo);
+    }
+  }
+
+  Future<void> _downloadAndInstallUpdate(AppUpdateInfo updateInfo) async {
+    if (_isInstallingUpdate) {
+      return;
+    }
+
+    final downloadProgress = ValueNotifier<double?>(null);
+    setState(() {
+      _isInstallingUpdate = true;
+      _updateDownloadProgress = null;
+    });
+
+    _showDownloadProgressDialog(downloadProgress);
+
+    try {
+      final apkFile = await UpdateService.instance.downloadApk(
+        updateInfo,
+        onProgress: (progress) {
+          if (!mounted) {
+            return;
+          }
+          _updateDownloadProgress = progress.fraction;
+          downloadProgress.value = progress.fraction;
+        },
+      );
+
+      if (!mounted) {
+        return;
+      }
+      Navigator.of(context, rootNavigator: true).pop();
+      _showBlockingProgressDialog(
+        title: 'Installing Update',
+        message: 'Preparing the device for update...',
+      );
+
+      await _platformChannel.invokeMethod<void>('prepareForAppUpdate');
+
+      final result = await _updateChannel.invokeMapMethod<String, dynamic>(
+        'installApk',
+        <String, dynamic>{'apkPath': apkFile.path},
+      );
+      if (!mounted) {
+        return;
+      }
+      Navigator.of(context, rootNavigator: true).pop();
+
+      final status = (result?['status'] ?? '').toString();
+      if (status == 'SUCCESS') {
+        await showDialog<void>(
+          context: context,
+          builder: (dialogContext) {
+            return AlertDialog(
+              backgroundColor: const Color(0xFF121212),
+              title: const Text(
+                'Update Installed',
+                style: TextStyle(color: Colors.white),
+              ),
+              content: const Text(
+                'The update was installed successfully. The launcher will restart.',
+                style: TextStyle(color: Colors.white70),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(dialogContext).pop(),
+                  child: const Text('OK'),
+                ),
+              ],
+            );
+          },
+        );
+      } else if (status == 'MANUAL_INSTALL_STARTED') {
+        await showDialog<void>(
+          context: context,
+          builder: (dialogContext) {
+            return AlertDialog(
+              backgroundColor: const Color(0xFF121212),
+              title: const Text(
+                'Approve Update',
+                style: TextStyle(color: Colors.white),
+              ),
+              content: Text(
+                (result?['message'] ??
+                        'Android package installer opened. Approve the update to continue.')
+                    .toString(),
+                style: const TextStyle(color: Colors.white70),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(dialogContext).pop(),
+                  child: const Text('OK'),
+                ),
+              ],
+            );
+          },
+        );
+      } else {
+        await _showUpdateErrorDialog(
+          (result?['message'] ?? 'Unable to install the update.').toString(),
+        );
+      }
+    } on PlatformException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      Navigator.of(context, rootNavigator: true).pop();
+      await _showUpdateErrorDialog(
+        error.message ?? 'Unable to install the update.',
+      );
+    } on UpdateServiceException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      Navigator.of(context, rootNavigator: true).pop();
+      await _showUpdateErrorDialog(error.message);
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      Navigator.of(context, rootNavigator: true).pop();
+      await _showUpdateErrorDialog('Unable to download the update.');
+    } finally {
+      downloadProgress.dispose();
+      if (mounted) {
+        setState(() {
+          _isInstallingUpdate = false;
+          _updateDownloadProgress = null;
+        });
+      } else {
+        _isInstallingUpdate = false;
+        _updateDownloadProgress = null;
+      }
+    }
+  }
+
+  void _showDownloadProgressDialog(ValueNotifier<double?> progressNotifier) {
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) {
+        return ValueListenableBuilder<double?>(
+          valueListenable: progressNotifier,
+          builder: (context, progress, _) {
+            return AlertDialog(
+              backgroundColor: const Color(0xFF121212),
+              title: const Text(
+                'Downloading Update',
+                style: TextStyle(color: Colors.white),
+              ),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  LinearProgressIndicator(value: progress),
+                  const SizedBox(height: 12),
+                  Text(
+                    progress == null
+                        ? 'Downloading...'
+                        : '${(progress * 100).round()}%',
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(color: Colors.white70),
+                  ),
+                ],
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Future<void> _showUpdateErrorDialog(String message) async {
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          backgroundColor: const Color(0xFF121212),
+          title: const Text(
+            'Update Failed',
+            style: TextStyle(color: Colors.white),
+          ),
+          content: Text(message, style: const TextStyle(color: Colors.white70)),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('OK'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
   Future<void> _showChangeAdminPinDialog() async {
     final currentController = TextEditingController();
     final newController = TextEditingController();
@@ -1446,10 +1854,31 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
                   children: [
                     _buildActiveSessionCard(),
                     _buildTile(
+                      "Sales",
+                      "View standalone totals and coin insert logs",
+                      Icons.receipt_long,
+                      onTap: _openStandaloneSalesPage,
+                    ),
+                    _buildTile(
                       "Change Admin PIN",
                       "Update your admin access PIN",
                       Icons.lock,
                       onTap: _showChangeAdminPinDialog,
+                    ),
+                    _buildTile(
+                      "Check for Updates",
+                      "Manually check GitHub Releases for a new APK",
+                      Icons.system_update,
+                      onTap: _isCheckingForUpdates || _isInstallingUpdate
+                          ? null
+                          : _checkForUpdates,
+                      trailing: _isCheckingForUpdates || _isInstallingUpdate
+                          ? const SizedBox(
+                              width: 22,
+                              height: 22,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : null,
                     ),
                     _buildTile(
                       "Power Off",
@@ -1484,7 +1913,10 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
                       ),
                       subtitle: Text(
                         _isStandaloneMode
-                            ? "Launcher <-> coin_controller direct WebSocket"
+                            ? _controllerCommunicationMode ==
+                                      AppSettings.controllerCommunicationModeHttp
+                                  ? "Launcher <-> coin_controller direct HTTP"
+                                  : "Launcher <-> coin_controller direct Socket"
                             : "Launcher <-> Node.js <-> piso kiosk",
                         style: const TextStyle(color: Colors.white70),
                       ),
@@ -1519,7 +1951,7 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
                             style: TextStyle(color: Colors.white),
                           ),
                           subtitle: const Text(
-                            'Connect directly to coin_controller over WebSocket.',
+                            'Connect directly to coin_controller.',
                             style: TextStyle(color: Colors.white70),
                           ),
                           onChanged: (value) {
@@ -1534,13 +1966,55 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
                         if (_isStandaloneMode) ...[
                           const ListTile(
                             title: Text(
-                              'coin_controller direct socket',
+                              'coin_controller communication',
                               style: TextStyle(color: Colors.white),
                             ),
                             subtitle: Text(
-                              'Use the controller static IP for the standalone socket connection.',
+                              'Choose Socket for the old firmware or HTTP for the REST firmware.',
                               style: TextStyle(color: Colors.white70),
                             ),
+                          ),
+                          RadioListTile<String>(
+                            value: AppSettings.controllerCommunicationModeSocket,
+                            groupValue: _controllerCommunicationMode,
+                            activeColor: Colors.tealAccent,
+                            title: const Text(
+                              'Socket',
+                              style: TextStyle(color: Colors.white),
+                            ),
+                            subtitle: const Text(
+                              'Use the existing direct WebSocket controller flow.',
+                              style: TextStyle(color: Colors.white70),
+                            ),
+                            onChanged: (value) {
+                              if (value == null) {
+                                return;
+                              }
+                              setState(() {
+                                _controllerCommunicationMode = value;
+                              });
+                            },
+                          ),
+                          RadioListTile<String>(
+                            value: AppSettings.controllerCommunicationModeHttp,
+                            groupValue: _controllerCommunicationMode,
+                            activeColor: Colors.tealAccent,
+                            title: const Text(
+                              'HTTP',
+                              style: TextStyle(color: Colors.white),
+                            ),
+                            subtitle: const Text(
+                              'Use the ESP32 REST API on port 80.',
+                              style: TextStyle(color: Colors.white70),
+                            ),
+                            onChanged: (value) {
+                              if (value == null) {
+                                return;
+                              }
+                              setState(() {
+                                _controllerCommunicationMode = value;
+                              });
+                            },
                           ),
                           Padding(
                             padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
@@ -1548,10 +2022,10 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
                               controller: _standaloneControllerIpController,
                               style: const TextStyle(color: Colors.white),
                               decoration: const InputDecoration(
-                                labelText: 'coin_controller IP',
+                                labelText: 'ESP32 Address',
                                 labelStyle: TextStyle(color: Colors.white70),
                                 helperText:
-                                    'Default: 192.168.1.3',
+                                    'Socket: 192.168.1.100. HTTP: pisocoin-A99B20.local or IP',
                                 helperStyle: TextStyle(color: Colors.white54),
                               ),
                             ),
@@ -1686,25 +2160,6 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
                                 ),
                               ],
                             ),
-                          ),
-                          ListTile(
-                            leading: const Icon(
-                              Icons.receipt_long,
-                              color: Colors.lightGreenAccent,
-                            ),
-                            title: const Text(
-                              'Standalone Sales',
-                              style: TextStyle(color: Colors.white),
-                            ),
-                            subtitle: const Text(
-                              'View totals and coin insert logs.',
-                              style: TextStyle(color: Colors.white70),
-                            ),
-                            trailing: const Icon(
-                              Icons.chevron_right,
-                              color: Colors.white70,
-                            ),
-                            onTap: _openStandaloneSalesPage,
                           ),
                         ],
                       ],
@@ -1899,6 +2354,47 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
                                     'Example: http://192.168.1.5/relay/0?turn=off',
                                 helperStyle: TextStyle(color: Colors.white54),
                               ),
+                            ),
+                          ),
+                        if (_chargerControlMode == AppSettings.chargerControlModeShelly)
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
+                            child: Row(
+                              children: [
+                                Expanded(
+                                  child: OutlinedButton.icon(
+                                    onPressed: _isTestingShellyCommand
+                                        ? null
+                                        : () => _testShellyCommand(
+                                              label: 'ON',
+                                              url: _shellyOnUrlController.text,
+                                            ),
+                                    icon: _isTestingShellyCommand
+                                        ? const SizedBox(
+                                            width: 16,
+                                            height: 16,
+                                            child: CircularProgressIndicator(
+                                              strokeWidth: 2,
+                                            ),
+                                          )
+                                        : const Icon(Icons.power_settings_new),
+                                    label: const Text('Test ON'),
+                                  ),
+                                ),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: OutlinedButton.icon(
+                                    onPressed: _isTestingShellyCommand
+                                        ? null
+                                        : () => _testShellyCommand(
+                                              label: 'OFF',
+                                              url: _shellyOffUrlController.text,
+                                            ),
+                                    icon: const Icon(Icons.power_off),
+                                    label: const Text('Test OFF'),
+                                  ),
+                                ),
+                              ],
                             ),
                           ),
                         if (_chargerControlMode == AppSettings.chargerControlModeShelly)

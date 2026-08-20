@@ -5,6 +5,7 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.media.AudioManager
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
@@ -12,6 +13,7 @@ import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.WindowManager
+import android.widget.LinearLayout
 import android.widget.TextView
 
 object RemainingTimeOverlayController {
@@ -19,7 +21,8 @@ object RemainingTimeOverlayController {
     private val handler = Handler(Looper.getMainLooper())
 
     private var windowManager: WindowManager? = null
-    private var overlayView: TextView? = null
+    private var overlayView: LinearLayout? = null
+    private var timeTextView: TextView? = null
     private var countdownExpiresAtMs: Long = 0L
     private var initialDisplayRemainingMs: Long = 0L
     private var countdownMultiplier: Double = 1.0
@@ -108,7 +111,7 @@ object RemainingTimeOverlayController {
         }
     }
 
-    private fun attachOverlayView(view: TextView, manager: WindowManager): Boolean {
+    private fun attachOverlayView(view: LinearLayout, manager: WindowManager): Boolean {
         removeExistingOverlay(manager, view)
 
         if (view.parent == null) {
@@ -123,7 +126,7 @@ object RemainingTimeOverlayController {
         return true
     }
 
-    private fun removeExistingOverlay(manager: WindowManager, view: TextView) {
+    private fun removeExistingOverlay(manager: WindowManager, view: LinearLayout) {
         if (view.parent == null) {
             return
         }
@@ -141,18 +144,28 @@ object RemainingTimeOverlayController {
         }
 
         windowManager = context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
-        overlayView = TextView(context).apply {
+        val timeLabel = TextView(context).apply {
             setTextColor(Color.parseColor("#79FFE1"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
             gravity = Gravity.CENTER
-            setPadding(dp(context, 14), dp(context, 8), dp(context, 14), dp(context, 8))
+            minWidth = dp(context, 54)
+            setPadding(dp(context, 8), 0, dp(context, 8), 0)
+        }
+        timeTextView = timeLabel
+
+        overlayView = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(dp(context, 7), dp(context, 5), dp(context, 7), dp(context, 5))
             background = GradientDrawable().apply {
                 shape = GradientDrawable.RECTANGLE
-                cornerRadius = dp(context, 14).toFloat()
+                cornerRadius = dp(context, 15).toFloat()
                 setColor(Color.argb(186, 0, 0, 0))
                 setStroke(dp(context, 1), Color.argb(90, 121, 255, 225))
             }
+            addView(buildVolumeButton(context) { showSystemVolumeSlider(context) })
+            addView(timeLabel)
         }
     }
 
@@ -196,12 +209,41 @@ object RemainingTimeOverlayController {
     }
 
     private fun updateOverlayText() {
-        overlayView?.text = staticLabel ?: run {
+        timeTextView?.text = staticLabel ?: run {
             val elapsedMs = (System.currentTimeMillis() - countdownStartedAtMs).coerceAtLeast(0L)
             val consumedMs = (elapsedMs * countdownMultiplier).toLong()
             val remainingMs = (initialDisplayRemainingMs - consumedMs).coerceAtLeast(0L)
             formatRemaining(remainingMs)
         }
+    }
+
+    private fun buildVolumeButton(
+        context: Context,
+        onClick: () -> Unit
+    ): TextView {
+        return TextView(context).apply {
+            text = "VOL"
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+            typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+            gravity = Gravity.CENTER
+            minWidth = dp(context, 34)
+            minHeight = dp(context, 28)
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.argb(85, 255, 255, 255))
+            }
+            setOnClickListener { onClick() }
+        }
+    }
+
+    private fun showSystemVolumeSlider(context: Context) {
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        audioManager.adjustStreamVolume(
+            AudioManager.STREAM_MUSIC,
+            AudioManager.ADJUST_SAME,
+            AudioManager.FLAG_SHOW_UI
+        )
     }
 
     private fun formatRemaining(remainingMs: Long): String {

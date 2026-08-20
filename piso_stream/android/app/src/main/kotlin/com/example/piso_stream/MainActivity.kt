@@ -27,9 +27,12 @@ import android.view.WindowInsetsController
 import android.view.WindowManager
 import android.content.pm.ApplicationInfo
 import android.content.pm.ActivityInfo
+import android.content.pm.PackageInstaller
 import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import android.net.nsd.NsdManager
+import android.net.nsd.NsdServiceInfo
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.graphics.Bitmap
@@ -46,11 +49,15 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import java.util.LinkedHashSet
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileInputStream
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.plugin.common.MethodChannel
@@ -60,10 +67,77 @@ class MainActivity : FlutterActivity() {
         const val EXTRA_SESSION_EXPIRED = "session_expired"
         const val EXTRA_FORCE_SCREEN_ON = "force_screen_on"
         const val EXTRA_ENFORCE_CLOSE_RETURN = "enforce_close_return"
+        const val ACTION_APP_UPDATE_INSTALL_STATUS =
+            "com.example.piso_stream.action.APP_UPDATE_INSTALL_STATUS"
+        const val EXTRA_APP_UPDATE_SESSION_ID = "app_update_session_id"
+        private val pendingInstallResults = ConcurrentHashMap<Int, MethodChannel.Result>()
+
+        fun completeAppUpdateInstall(
+            context: Context,
+            sessionId: Int,
+            status: Int,
+            message: String?
+        ) {
+            val result = pendingInstallResults.remove(sessionId)
+            val mappedStatus = mapInstallStatus(status)
+            val payload = mapOf(
+                "status" to mappedStatus,
+                "message" to (message ?: defaultInstallMessage(mappedStatus)),
+                "sessionId" to sessionId
+            )
+            result?.success(payload)
+            if (status == PackageInstaller.STATUS_SUCCESS) {
+                Handler(Looper.getMainLooper()).postDelayed({
+                    relaunchInstalledApp(context)
+                }, 1200L)
+            }
+        }
+
+        private fun mapInstallStatus(status: Int): String {
+            return when (status) {
+                PackageInstaller.STATUS_SUCCESS -> "SUCCESS"
+                PackageInstaller.STATUS_FAILURE_INVALID -> "INVALID_APK"
+                PackageInstaller.STATUS_FAILURE_INCOMPATIBLE -> "INCOMPATIBLE_APK"
+                PackageInstaller.STATUS_FAILURE_CONFLICT -> "SIGNATURE_MISMATCH"
+                PackageInstaller.STATUS_FAILURE_STORAGE -> "INSUFFICIENT_STORAGE"
+                PackageInstaller.STATUS_FAILURE_BLOCKED -> "DEVICE_OWNER_ERROR"
+                PackageInstaller.STATUS_FAILURE_ABORTED -> "INSTALLATION_SESSION_ERROR"
+                else -> "UNKNOWN_ERROR"
+            }
+        }
+
+        private fun defaultInstallMessage(status: String): String {
+            return when (status) {
+                "SUCCESS" -> "Update installed successfully."
+                "INVALID_APK" -> "The downloaded APK is invalid."
+                "INCOMPATIBLE_APK" -> "The APK is not compatible with this device."
+                "SIGNATURE_MISMATCH" -> "The APK signature does not match this app."
+                "INSUFFICIENT_STORAGE" -> "There is not enough storage to install the update."
+                "DEVICE_OWNER_ERROR" -> "This device is not configured for managed application updates."
+                "INSTALLATION_SESSION_ERROR" -> "The update installation was cancelled."
+                else -> "Unable to install the update."
+            }
+        }
+
+        private fun relaunchInstalledApp(context: Context) {
+            try {
+                val launchIntent = context.packageManager.getLaunchIntentForPackage(context.packageName)
+                    ?: return
+                launchIntent.addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                        Intent.FLAG_ACTIVITY_SINGLE_TOP
+                )
+                context.startActivity(launchIntent)
+            } catch (error: Exception) {
+                Log.w("PisoStreamKiosk", "Unable to relaunch app after update", error)
+            }
+        }
     }
 
     private val logTag = "PisoStreamKiosk"
     private val channelName = "com.example.piso_stream/installed_apps"
+    private val updateChannelName = "pisostream/app_update"
     private val sessionAlertChannelId = "session_alerts"
     private val sessionAlertNotificationId = 3101
     private val sessionWarnOneMinuteRequestCode = 3102
@@ -163,6 +237,22 @@ class MainActivity : FlutterActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, updateChannelName)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "isDeviceOwner" -> result.success(isDeviceOwnerApp())
+                    "installApk" -> {
+                        val apkPath = call.argument<String>("apkPath")
+                        if (apkPath.isNullOrBlank()) {
+                            result.error("INVALID_APK", "APK path is required.", null)
+                        } else {
+                            installUpdateApk(apkPath, result)
+                        }
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
             .setMethodCallHandler { call, result ->
                 when (call.method) {
@@ -253,6 +343,15 @@ class MainActivity : FlutterActivity() {
                             result.success(null)
                         } else {
                             result.error("WIFI_SETTINGS_UNAVAILABLE", "Unable to open Wi-Fi settings.", null)
+                        }
+                    }
+                    "resolveMdnsHost" -> {
+                        val hostname = call.argument<String>("hostname")
+                        val serviceType = call.argument<String>("serviceType") ?: "_ws._tcp."
+                        if (hostname.isNullOrBlank()) {
+                            result.error("INVALID_HOSTNAME", "Hostname is required.", null)
+                        } else {
+                            resolveMdnsHost(hostname, serviceType, result)
                         }
                     }
                     "resetWhitelistedApps" -> {
@@ -429,6 +528,173 @@ class MainActivity : FlutterActivity() {
             restoreKioskRestrictions()
         } else {
             enterKioskMode()
+        }
+    }
+
+    private fun resolveMdnsHost(
+        hostname: String,
+        serviceType: String,
+        result: MethodChannel.Result
+    ) {
+        val requestedHostname = hostname.trim().removeSuffix(".")
+        val serviceName = requestedHostname.removeSuffix(".local")
+        val discoveryServiceType =
+            serviceType.trim().ifBlank { "_ws._tcp." }
+        if (serviceName.isBlank()) {
+            result.error("INVALID_HOSTNAME", "Hostname is required.", null)
+            return
+        }
+
+        val nsdManager = getSystemService(Context.NSD_SERVICE) as? NsdManager
+        if (nsdManager == null) {
+            result.error("NSD_UNAVAILABLE", "Android NSD service is unavailable.", null)
+            return
+        }
+
+        val wifiManager =
+            applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+        val multicastLock = wifiManager?.createMulticastLock("piso_stream_mdns")?.apply {
+            setReferenceCounted(false)
+            try {
+                acquire()
+            } catch (error: Exception) {
+                Log.w(logTag, "Unable to acquire multicast lock for mDNS", error)
+            }
+        }
+
+        val completed = AtomicBoolean(false)
+        val mdnsHandler = Handler(Looper.getMainLooper())
+        var discoveryStarted = false
+        var discoveryListener: NsdManager.DiscoveryListener? = null
+        lateinit var timeoutRunnable: Runnable
+
+        fun releaseResources() {
+            if (discoveryStarted) {
+                try {
+                    discoveryListener?.let(nsdManager::stopServiceDiscovery)
+                } catch (_: Exception) {
+                }
+            }
+            try {
+                if (multicastLock?.isHeld == true) {
+                    multicastLock.release()
+                }
+            } catch (_: Exception) {
+            }
+        }
+
+        fun completeSuccess(address: String) {
+            if (!completed.compareAndSet(false, true)) {
+                return
+            }
+            mdnsHandler.removeCallbacks(timeoutRunnable)
+            releaseResources()
+            runOnUiThread {
+                result.success(address)
+            }
+        }
+
+        fun completeError(code: String, message: String) {
+            if (!completed.compareAndSet(false, true)) {
+                return
+            }
+            mdnsHandler.removeCallbacks(timeoutRunnable)
+            releaseResources()
+            runOnUiThread {
+                result.error(code, message, null)
+            }
+        }
+
+        timeoutRunnable = Runnable {
+            completeError(
+                "MDNS_RESOLVE_TIMEOUT",
+                "Unable to resolve $requestedHostname on $discoveryServiceType."
+            )
+        }
+
+        val resolveListener = object : NsdManager.ResolveListener {
+            override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
+                completeError(
+                    "MDNS_RESOLVE_FAILED",
+                    "Unable to resolve $requestedHostname. Android NSD error: $errorCode"
+                )
+            }
+
+            override fun onServiceResolved(serviceInfo: NsdServiceInfo) {
+                val address = serviceInfo.host?.hostAddress
+                if (address.isNullOrBlank()) {
+                    completeError(
+                        "MDNS_RESOLVE_FAILED",
+                        "Resolved $requestedHostname but no IP address was returned."
+                    )
+                    return
+                }
+                completeSuccess(address)
+            }
+        }
+
+        discoveryListener = object : NsdManager.DiscoveryListener {
+            override fun onDiscoveryStarted(regType: String) {
+                discoveryStarted = true
+                Log.d(logTag, "mDNS discovery started for $requestedHostname")
+            }
+
+            override fun onServiceFound(serviceInfo: NsdServiceInfo) {
+                val discoveredName = serviceInfo.serviceName
+                val normalizedDiscoveredName =
+                    discoveredName.removeSuffix(".local")
+                if (normalizedDiscoveredName.equals(serviceName, ignoreCase = true)) {
+                    Log.d(logTag, "mDNS service found: $discoveredName")
+                    try {
+                        nsdManager.resolveService(serviceInfo, resolveListener)
+                    } catch (error: Exception) {
+                        completeError(
+                            "MDNS_RESOLVE_FAILED",
+                            error.message ?: "Unable to resolve $requestedHostname."
+                        )
+                    }
+                }
+            }
+
+            override fun onServiceLost(serviceInfo: NsdServiceInfo) {
+            }
+
+            override fun onDiscoveryStopped(serviceType: String) {
+                discoveryStarted = false
+            }
+
+            override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
+                completeError(
+                    "MDNS_DISCOVERY_FAILED",
+                    "Unable to start mDNS discovery. Android NSD error: $errorCode"
+                )
+            }
+
+            override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {
+                Log.w(logTag, "Unable to stop mDNS discovery. Android NSD error: $errorCode")
+            }
+        }
+
+        mdnsHandler.postDelayed(timeoutRunnable, 5000L)
+        try {
+            val listener = discoveryListener ?: run {
+                completeError(
+                    "MDNS_DISCOVERY_FAILED",
+                    "Unable to prepare mDNS discovery."
+                )
+                return
+            }
+            nsdManager.discoverServices(
+                discoveryServiceType,
+                NsdManager.PROTOCOL_DNS_SD,
+                listener
+            )
+        } catch (error: Exception) {
+            mdnsHandler.removeCallbacks(timeoutRunnable)
+            completeError(
+                "MDNS_DISCOVERY_FAILED",
+                error.message ?: "Unable to start mDNS discovery."
+            )
         }
     }
 
@@ -640,6 +906,111 @@ class MainActivity : FlutterActivity() {
 
     private fun isDeviceOwnerApp(): Boolean {
         return devicePolicyManager?.isDeviceOwnerApp(packageName) == true
+    }
+
+    private fun installUpdateApk(apkPath: String, result: MethodChannel.Result) {
+        val apkFile = File(apkPath)
+        if (!apkFile.exists() || !apkFile.isFile || apkFile.length() <= 0L) {
+            result.error("INVALID_APK", "The downloaded APK is invalid.", null)
+            return
+        }
+
+        if (!isDeviceOwnerApp()) {
+            openManualApkInstaller(apkFile, result)
+            return
+        }
+
+        resetExecutor.execute {
+            var session: PackageInstaller.Session? = null
+            var sessionId: Int? = null
+            try {
+                val packageInstaller = packageManager.packageInstaller
+                val params = PackageInstaller.SessionParams(
+                    PackageInstaller.SessionParams.MODE_FULL_INSTALL
+                ).apply {
+                    setAppPackageName(packageName)
+                }
+                val createdSessionId = packageInstaller.createSession(params)
+                sessionId = createdSessionId
+                val openedSession = packageInstaller.openSession(createdSessionId)
+                session = openedSession
+
+                FileInputStream(apkFile).use { input ->
+                    openedSession.openWrite("pisostream_update.apk", 0, apkFile.length()).use { output ->
+                        input.copyTo(output)
+                        openedSession.fsync(output)
+                    }
+                }
+
+                pendingInstallResults[createdSessionId] = result
+                Handler(Looper.getMainLooper()).postDelayed({
+                    val pendingResult = pendingInstallResults.remove(createdSessionId)
+                    pendingResult?.success(
+                        mapOf(
+                            "status" to "INSTALLATION_SESSION_ERROR",
+                            "message" to "The update installation did not return a result.",
+                            "sessionId" to createdSessionId
+                        )
+                    )
+                }, TimeUnit.MINUTES.toMillis(5))
+
+                val intent = Intent(this, AppUpdateInstallReceiver::class.java).apply {
+                    action = ACTION_APP_UPDATE_INSTALL_STATUS
+                    putExtra(EXTRA_APP_UPDATE_SESSION_ID, createdSessionId)
+                    setPackage(packageName)
+                }
+                val pendingIntent = PendingIntent.getBroadcast(
+                    this,
+                    createdSessionId,
+                    intent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+                openedSession.commit(pendingIntent.intentSender)
+                openedSession.close()
+            } catch (error: Exception) {
+                sessionId?.let { pendingInstallResults.remove(it) }
+                try {
+                    session?.abandon()
+                } catch (_: Exception) {
+                }
+                runOnUiThread {
+                    result.error(
+                        "INSTALLATION_SESSION_ERROR",
+                        error.message ?: "Unable to install the update.",
+                        null
+                    )
+                }
+            }
+        }
+    }
+
+    private fun openManualApkInstaller(apkFile: File, result: MethodChannel.Result) {
+        try {
+            prepareForAppUpdate()
+            val apkUri = FileProvider.getUriForFile(
+                this,
+                "$packageName.fileprovider",
+                apkFile
+            )
+            val installIntent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(apkUri, "application/vnd.android.package-archive")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            startActivity(installIntent)
+            result.success(
+                mapOf(
+                    "status" to "MANUAL_INSTALL_STARTED",
+                    "message" to "Android package installer opened. Approve the update to continue."
+                )
+            )
+        } catch (error: Exception) {
+            result.error(
+                "MANUAL_INSTALL_ERROR",
+                error.message ?: "Unable to open Android package installer.",
+                null
+            )
+        }
     }
 
     private fun isCurrentlyInLockTaskMode(): Boolean {
@@ -1435,7 +1806,30 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun prepareForAppUpdate() {
-        setAppUpdatesAllowed(true)
+        setAppUpdatesAllowed(true, reapplyPolicies = false)
+        if (isDeviceOwnerApp()) {
+            val dpm = devicePolicyManager
+            if (dpm != null) {
+                try {
+                    setAllowedLockTaskPackages(
+                        "com.android.settings",
+                        playStorePackageName,
+                        *packageInstallerPackageNames
+                    )
+                    dpm.clearUserRestriction(adminComponent, UserManager.DISALLOW_INSTALL_APPS)
+                    dpm.clearUserRestriction(adminComponent, UserManager.DISALLOW_APPS_CONTROL)
+                    dpm.clearUserRestriction(adminComponent, UserManager.DISALLOW_UNINSTALL_APPS)
+                    dpm.clearUserRestriction(adminComponent, "no_install_unknown_sources")
+                    dpm.clearUserRestriction(adminComponent, "no_install_unknown_sources_globally")
+                    restoreInstallAccess(dpm)
+                    dpm.setStatusBarDisabled(adminComponent, false)
+                    Log.d(logTag, "Prepared kiosk policies for app update")
+                } catch (error: Exception) {
+                    Log.w(logTag, "Unable to fully prepare app update policies", error)
+                }
+            }
+        }
+        restoreNormalSystemUi()
         exitKioskMode()
     }
 
@@ -1925,6 +2319,13 @@ class MainActivity : FlutterActivity() {
         val batteryLevel = batteryManager?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
             ?.takeIf { it >= 0 }
             ?: 0
+        val batteryIntent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val batteryStatus = batteryIntent?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+        val pluggedStatus = batteryIntent?.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) ?: 0
+        val isCharging =
+            batteryStatus == BatteryManager.BATTERY_STATUS_CHARGING ||
+                batteryStatus == BatteryManager.BATTERY_STATUS_FULL ||
+                pluggedStatus != 0
 
         val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
         val activeNetwork = connectivityManager?.activeNetwork
@@ -1956,6 +2357,7 @@ class MainActivity : FlutterActivity() {
 
         return mapOf(
             "batteryLevel" to batteryLevel,
+            "isCharging" to isCharging,
             "connectionLabel" to connectionLabel,
             "signalLevel" to signalLevel
         )
@@ -1973,11 +2375,15 @@ class MainActivity : FlutterActivity() {
         finishAffinity()
     }
 
-    private fun setAppUpdatesAllowed(allowed: Boolean) {
+    private fun setAppUpdatesAllowed(allowed: Boolean, reapplyPolicies: Boolean = true) {
         getSharedPreferences(policyPrefsName, Context.MODE_PRIVATE)
             .edit()
             .putBoolean(allowAppUpdatesKey, allowed)
             .apply()
+
+        if (!reapplyPolicies) {
+            return
+        }
 
         if (isKioskModeEnabled()) {
             applyHardKioskPolicies()

@@ -3,6 +3,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 class AppSettings {
   static const String setupModeKey = 'setup_mode';
   static const String standaloneControllerIpKey = 'standalone_controller_ip';
+  static const String controllerCommunicationModeKey =
+      'controller_communication_mode';
   static const String businessNameKey = 'business_name';
   static const String deviceNameKey = 'device_name';
   static const String portraitWallpaperKey = 'portrait_wallpaper_path';
@@ -18,6 +20,9 @@ class AppSettings {
   static const String currentCustomerKey = 'current_customer_username';
   static const String currentCustomerRoleKey = 'current_customer_role';
   static const String sessionExpiresAtKey = 'session_expires_at';
+  static const String returnToMenuOnHomeKey = 'return_to_menu_on_home';
+  static const String returnToMenuSessionExpiresAtKey =
+      'return_to_menu_session_expires_at';
   static const String customerIdleDeadlineKey = 'customer_idle_deadline';
   static const String kioskDeviceIdKey = 'kiosk_device_id';
   static const String kioskDeviceTokenKey = 'kiosk_device_token';
@@ -64,6 +69,8 @@ class AppSettings {
   static const String chargerControlModeShelly = 'shelly';
   static const String setupModeServer = 'server';
   static const String setupModeStandalone = 'standalone';
+  static const String controllerCommunicationModeSocket = 'socket';
+  static const String controllerCommunicationModeHttp = 'http';
 
   static bool isStandaloneModeValue(String? value) {
     return (value ?? '').trim().toLowerCase() == setupModeStandalone;

@@ -104,6 +104,7 @@ class _MenuPageState extends State<MenuPage> {
         _remainingTime.inSeconds < _secondSessionWarningSeconds;
     _currentCustomerUsername = widget.currentCustomerUsername;
     _currentCustomerRole = widget.currentCustomerRole;
+    unawaited(_markReturnToMenuOnHome());
     if (!widget.isOpenTime) {
       _startTimer();
     }
@@ -125,6 +126,25 @@ class _MenuPageState extends State<MenuPage> {
   late final WidgetsBindingObserver _lifecycleObserver = _MenuLifecycleObserver(
     onResumed: _handleResumeChecks,
   );
+
+  Future<void> _markReturnToMenuOnHome() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(AppSettings.returnToMenuOnHomeKey, true);
+    if (_sessionExpiresAt == null) {
+      await prefs.remove(AppSettings.returnToMenuSessionExpiresAtKey);
+    } else {
+      await prefs.setInt(
+        AppSettings.returnToMenuSessionExpiresAtKey,
+        _sessionExpiresAt!.millisecondsSinceEpoch,
+      );
+    }
+  }
+
+  Future<void> _clearReturnToMenuOnHome() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(AppSettings.returnToMenuOnHomeKey);
+    await prefs.remove(AppSettings.returnToMenuSessionExpiresAtKey);
+  }
 
   Future<void> _initializeDeviceStateSync() async {
     final prefs = await SharedPreferences.getInstance();
@@ -272,6 +292,8 @@ class _MenuPageState extends State<MenuPage> {
   Future<void> _goToMainPage({bool scheduleReset = false}) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(AppSettings.sessionExpiresAtKey);
+    await prefs.remove(AppSettings.returnToMenuOnHomeKey);
+    await prefs.remove(AppSettings.returnToMenuSessionExpiresAtKey);
 
     if (scheduleReset) {
       final isDeepFreezeEnabled =
@@ -760,6 +782,7 @@ class _MenuPageState extends State<MenuPage> {
     }
 
     try {
+      await _markReturnToMenuOnHome();
       if (widget.isOpenTime) {
         await _channel.invokeMethod<void>('startOpenTimeOverlay');
       } else if (_sessionExpiresAt != null) {
@@ -804,6 +827,7 @@ class _MenuPageState extends State<MenuPage> {
     try {
       await _cancelSessionWarningNotification();
       await _cancelSessionMonitoring();
+      await _clearReturnToMenuOnHome();
       final prefs = await SharedPreferences.getInstance();
       await prefs.remove(AppSettings.sessionExpiresAtKey);
 

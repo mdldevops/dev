@@ -28,6 +28,7 @@ class _DeviceStatusBarState extends State<DeviceStatusBar> {
   int _batteryLevel = 0;
   int _signalLevel = 0;
   String _connectionLabel = 'Offline';
+  bool _isCharging = false;
 
   @override
   void initState() {
@@ -71,6 +72,7 @@ class _DeviceStatusBarState extends State<DeviceStatusBar> {
 
       setState(() {
         _batteryLevel = (result['batteryLevel'] as num?)?.toInt() ?? 0;
+        _isCharging = result['isCharging'] == true;
         _signalLevel = (result['signalLevel'] as num?)?.toInt() ?? 0;
         _connectionLabel =
             (result['connectionLabel'] as String?)?.trim().isNotEmpty == true
@@ -114,6 +116,37 @@ class _DeviceStatusBarState extends State<DeviceStatusBar> {
     return Icons.signal_wifi_off;
   }
 
+  IconData _batteryIcon() {
+    if (_isCharging) {
+      return Icons.battery_charging_full;
+    }
+
+    final level = _batteryLevel.clamp(0, 100);
+    if (level >= 90) {
+      return Icons.battery_full;
+    }
+    if (level >= 60) {
+      return Icons.battery_6_bar;
+    }
+    if (level >= 35) {
+      return Icons.battery_4_bar;
+    }
+    if (level >= 15) {
+      return Icons.battery_2_bar;
+    }
+    return Icons.battery_alert;
+  }
+
+  Color _batteryColor() {
+    if (_isCharging) {
+      return Colors.lightGreenAccent;
+    }
+    if (_batteryLevel <= 15) {
+      return Colors.redAccent;
+    }
+    return Colors.white70;
+  }
+
   @override
   Widget build(BuildContext context) {
     const style = TextStyle(
@@ -133,6 +166,8 @@ class _DeviceStatusBarState extends State<DeviceStatusBar> {
             const SizedBox(width: 8),
             Text(_connectionLabel, style: style),
             const SizedBox(width: 8),
+            Icon(_batteryIcon(), color: _batteryColor(), size: 16),
+            const SizedBox(width: 4),
             Text('${_batteryLevel.clamp(0, 100)}%', style: style),
           ],
         ),

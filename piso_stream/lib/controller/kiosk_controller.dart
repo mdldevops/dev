@@ -405,11 +405,14 @@ class KioskController {
 
   void _startStandaloneHeartbeat() {
     _standaloneHeartbeatTimer?.cancel();
-    if (!_backgroundServicesEnabled) {
-      return;
-    }
+    unawaited(
+      StandaloneMqttService.instance.ping(
+        launcherDeviceId: deviceId,
+        launcherDeviceName: deviceName,
+      ),
+    );
     _standaloneHeartbeatTimer = Timer.periodic(
-      const Duration(seconds: 20),
+      const Duration(seconds: 12),
       (_) {
         if (!_isStandaloneMode || !isActive) {
           return;

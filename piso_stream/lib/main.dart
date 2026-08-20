@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:piso_stream/menu_page.dart';
 import 'dart:io';
 import 'package:provider/provider.dart';
@@ -141,13 +142,13 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
     with RouteAware, WidgetsBindingObserver {
   static const String _defaultBusinessName = 'PISO STREAM';
   static const String _defaultDeviceName = 'CP1';
-  static const String _launcherVersion = 'Launcher v1.0.2+2';
   static const MethodChannel _platformChannel = MethodChannel(
     'com.example.piso_stream/installed_apps',
   );
 
   String _businessName = _defaultBusinessName;
   String _deviceName = _defaultDeviceName;
+  String _launcherVersion = 'Launcher';
   String _setupMode = AppSettings.setupModeServer;
   String? _portraitWallpaperPath;
   String? _landscapeWallpaperPath;
@@ -167,15 +168,16 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
   String? _deviceId;
   bool _isStartingCoinSession = false;
   bool _backgroundServicesEnabled = true;
+  bool _isRestoringMenuPage = false;
 
-  bool get _isStandaloneMode =>
-      AppSettings.isStandaloneModeValue(_setupMode);
+  bool get _isStandaloneMode => AppSettings.isStandaloneModeValue(_setupMode);
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _enableKioskMode();
+    _loadLauncherVersion();
     _loadSavedSettings();
   }
 
@@ -230,9 +232,7 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
       debugPrint('[ChargingMonitor][main] requesting refresh');
       final result = await _platformChannel.invokeMapMethod<String, dynamic>(
         'refreshChargingMonitor',
-        {
-          'resetDecisionCache': false,
-        },
+        {'resetDecisionCache': false},
       );
       debugPrint(
         '[ChargingMonitor][main] result=${result ?? <String, dynamic>{}}',
@@ -255,6 +255,21 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
       await _platformChannel.invokeMethod<void>('enterKioskMode');
     } on PlatformException {
       // Best effort only. Native side may still re-apply on resume/app launch.
+    }
+  }
+
+  Future<void> _loadLauncherVersion() async {
+    try {
+      final packageInfo = await PackageInfo.fromPlatform();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _launcherVersion =
+            'Launcher v${packageInfo.version}+${packageInfo.buildNumber}';
+      });
+    } catch (_) {
+      // Keep the fallback label if package metadata is unavailable.
     }
   }
 
@@ -303,6 +318,11 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
         : DateTime.fromMillisecondsSinceEpoch(idleDeadlineMillis);
     final didExpire =
         prefs.getBool(AppSettings.sessionExpiredPendingKey) ?? false;
+    final shouldReturnToMenu =
+        prefs.getBool(AppSettings.returnToMenuOnHomeKey) ?? false;
+    final returnToMenuSessionExpiresAtMillis = prefs.getInt(
+      AppSettings.returnToMenuSessionExpiresAtKey,
+    );
     var showExpiredSnackbar = false;
 
     if (didExpire) {
@@ -382,6 +402,15 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
     }
 
     _startResetWatcher();
+    _restoreMenuPageIfSessionIsActive(
+      currentCustomerUsername: currentCustomer,
+      currentCustomerRole: currentCustomerRole,
+      sessionExpiresAtMillis:
+          prefs.getInt(AppSettings.sessionExpiresAtKey) ??
+          returnToMenuSessionExpiresAtMillis,
+      sessionExpiredPending: showExpiredSnackbar,
+      returnToMenuRequested: shouldReturnToMenu,
+    );
     await _startCustomerIdleTimer();
     if (!_backgroundServicesEnabled) {
       _deviceStateTimer?.cancel();
@@ -415,6 +444,74 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
     _deviceStateTimer = Timer.periodic(const Duration(seconds: 30), (_) {
       _syncDeviceState();
     });
+  }
+
+  void _restoreMenuPageIfSessionIsActive({
+    required String? currentCustomerUsername,
+    required String? currentCustomerRole,
+    required int? sessionExpiresAtMillis,
+    required bool sessionExpiredPending,
+    required bool returnToMenuRequested,
+  }) {
+    if (_isRestoringMenuPage ||
+        _isStartingCoinSession ||
+        sessionExpiredPending) {
+      return;
+    }
+
+    final normalizedRole = currentCustomerRole?.trim().toLowerCase();
+    final isOpenTime = normalizedRole == 'admin';
+    final sessionExpiresAt = sessionExpiresAtMillis == null
+        ? null
+        : DateTime.fromMillisecondsSinceEpoch(sessionExpiresAtMillis);
+    final remaining = sessionExpiresAt?.difference(DateTime.now());
+    final hasActiveTimedSession =
+        remaining != null && remaining > Duration.zero;
+
+    if (!returnToMenuRequested && !isOpenTime && !hasActiveTimedSession) {
+      return;
+    }
+
+    if (returnToMenuRequested && !isOpenTime && !hasActiveTimedSession) {
+      unawaited(_clearReturnToMenuOnHome());
+      return;
+    }
+
+    _isRestoringMenuPage = true;
+    _customerIdleTimer?.cancel();
+    _deviceLockTimer?.cancel();
+    _deviceStateTimer?.cancel();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        _isRestoringMenuPage = false;
+        return;
+      }
+
+      final wallpaperPath = _wallpaperPathForOrientation(
+        MediaQuery.of(context).orientation,
+      );
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(
+          builder: (_) => MenuPage(
+            businessName: _businessName,
+            deviceName: _deviceName,
+            wallpaperPath: wallpaperPath,
+            initialSessionTime: isOpenTime
+                ? Duration.zero
+                : (remaining ?? Duration.zero),
+            currentCustomerUsername: currentCustomerUsername,
+            currentCustomerRole: normalizedRole,
+            isOpenTime: isOpenTime,
+          ),
+        ),
+      );
+    });
+  }
+
+  Future<void> _clearReturnToMenuOnHome() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(AppSettings.returnToMenuOnHomeKey);
+    await prefs.remove(AppSettings.returnToMenuSessionExpiresAtKey);
   }
 
   Future<int?> _getBatteryLevel() async {
@@ -637,116 +734,117 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
     }
 
     try {
-    if (_isDeviceLocked) {
-      if (!mounted) {
+      if (_isDeviceLocked) {
+        if (!mounted) {
+          return;
+        }
+
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(_deviceLockMessage)));
         return;
       }
 
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(_deviceLockMessage)));
-      return;
-    }
+      if (_isStandaloneMode) {
+        final launcherDeviceId =
+            await DeviceIdentityService.getOrCreateDeviceId();
+        final controller = StandaloneMqttService.instance;
+        final connected = await controller.connectBySavedHost();
 
-    if (_isStandaloneMode) {
-      final launcherDeviceId = await DeviceIdentityService.getOrCreateDeviceId();
-      final controller = StandaloneMqttService.instance;
-      final connected = await controller.connectBySavedHost();
+        if (!mounted) {
+          return;
+        }
 
-      if (!mounted) {
-        return;
-      }
-
-      if (!connected) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text(
-              'Unable to connect to the standalone coin controller.',
+        if (!connected) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text(
+                'Unable to connect to the standalone coin controller.',
+              ),
             ),
+          );
+          return;
+        }
+
+        final openResult = await controller.openSession(
+          launcherDeviceId: launcherDeviceId,
+          launcherDeviceName: _deviceName,
+        );
+
+        if (!mounted) {
+          return;
+        }
+
+        if (!openResult.allowed) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text(openResult.message)));
+          return;
+        }
+      } else {
+        final deviceId = await DeviceIdentityService.getOrCreateDeviceId();
+        final sessionResult = await ApiService.startSessionWithRetry(
+          deviceId,
+          _deviceName,
+        );
+
+        if (!mounted) {
+          return;
+        }
+
+        if (sessionResult == null) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Unable to contact the server right now.'),
+            ),
+          );
+          return;
+        }
+
+        final status = (sessionResult['status'] ?? '').toString();
+        if (status == 'locked') {
+          final message = (sessionResult['message'] ?? 'Device is locked.')
+              .toString();
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text(message)));
+          return;
+        }
+
+        if (status == 'busy') {
+          final message =
+              (sessionResult['message'] ??
+                      'Another customer is currently inserting coins. Please try again in a moment.')
+                  .toString();
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text(message)));
+          return;
+        }
+
+        if (status != 'started') {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Unable to start coin session.')),
+          );
+          return;
+        }
+      }
+
+      _customerIdleTimer?.cancel();
+      await CustomerAccountService.clearIdleDeadline();
+
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(
+          builder: (_) => CoinSessionPage(
+            businessName: _businessName,
+            deviceName: _deviceName,
+            wallpaperPath: wallpaperPath,
+            sessionAlreadyStarted: true,
+            currentCustomerUsername: _currentCustomerUsername,
+            currentCustomerRole: _currentCustomerRole,
           ),
-        );
-        return;
-      }
-
-      final openResult = await controller.openSession(
-        launcherDeviceId: launcherDeviceId,
-        launcherDeviceName: _deviceName,
-      );
-
-      if (!mounted) {
-        return;
-      }
-
-      if (!openResult.allowed) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text(openResult.message)));
-        return;
-      }
-    } else {
-      final deviceId = await DeviceIdentityService.getOrCreateDeviceId();
-      final sessionResult = await ApiService.startSessionWithRetry(
-        deviceId,
-        _deviceName,
-      );
-
-      if (!mounted) {
-        return;
-      }
-
-      if (sessionResult == null) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Unable to contact the server right now.'),
-          ),
-        );
-        return;
-      }
-
-      final status = (sessionResult['status'] ?? '').toString();
-      if (status == 'locked') {
-        final message = (sessionResult['message'] ?? 'Device is locked.')
-            .toString();
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text(message)));
-        return;
-      }
-
-      if (status == 'busy') {
-        final message =
-            (sessionResult['message'] ??
-                    'Another customer is currently inserting coins. Please try again in a moment.')
-                .toString();
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text(message)));
-        return;
-      }
-
-      if (status != 'started') {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Unable to start coin session.')),
-        );
-        return;
-      }
-    }
-
-    _customerIdleTimer?.cancel();
-    await CustomerAccountService.clearIdleDeadline();
-
-    Navigator.of(context).pushReplacement(
-      MaterialPageRoute(
-        builder: (_) => CoinSessionPage(
-          businessName: _businessName,
-          deviceName: _deviceName,
-          wallpaperPath: wallpaperPath,
-          sessionAlreadyStarted: true,
-          currentCustomerUsername: _currentCustomerUsername,
-          currentCustomerRole: _currentCustomerRole,
         ),
-      ),
-    );
+      );
     } finally {
       if (mounted) {
         setState(() {
@@ -988,6 +1086,10 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
     final themeProvider = Provider.of<ThemeProvider>(context);
     final orientation = MediaQuery.of(context).orientation;
     final wallpaperPath = _wallpaperPathForOrientation(orientation);
+    final VoidCallback? openCoinSession =
+        _isDeviceLocked || _isStartingCoinSession
+        ? null
+        : () => unawaited(_startCoinSession(wallpaperPath));
 
     return Scaffold(
       resizeToAvoidBottomInset: false,
@@ -1065,9 +1167,9 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
                           borderRadius: BorderRadius.circular(999),
                           border: Border.all(color: Colors.white12),
                         ),
-                        child: const Text(
+                        child: Text(
                           _launcherVersion,
-                          style: TextStyle(
+                          style: const TextStyle(
                             color: Colors.white70,
                             fontSize: 12,
                             fontWeight: FontWeight.w600,
@@ -1087,21 +1189,29 @@ class _ArcadeLaunchPageState extends State<ArcadeLaunchPage>
                         ),
                     ],
                   ),
-                  const Spacer(),
-                  _ArcadeHeadline(
-                    title: _isDeviceLocked
-                        ? 'DEVICE LOCKED'
-                        : (_isStartingCoinSession ? 'OPENING COIN...' : 'INSERT COIN'),
-                    subtitle: _isDeviceLocked
-                        ? _deviceLockMessage
-                        : (_isStartingCoinSession
-                              ? 'Please wait while the coin controller is opening'
-                              : 'Insert coin to start playing'),
-                    onTap: _isDeviceLocked || _isStartingCoinSession
-                        ? null
-                        : () => _startCoinSession(wallpaperPath),
+                  const SizedBox(height: 8),
+                  Expanded(
+                    flex: 3,
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: openCoinSession,
+                      child: Center(
+                        child: _ArcadeHeadline(
+                          title: _isDeviceLocked
+                              ? 'DEVICE LOCKED'
+                              : (_isStartingCoinSession
+                                    ? 'OPENING COIN...'
+                                    : 'INSERT COIN'),
+                          subtitle: _isDeviceLocked
+                              ? _deviceLockMessage
+                              : (_isStartingCoinSession
+                                    ? 'Please wait while the coin controller is opening'
+                                    : 'Insert coin to start playing'),
+                          onTap: openCoinSession,
+                        ),
+                      ),
+                    ),
                   ),
-                  const Spacer(flex: 2),
                   _SessionNote(message: _sessionNoteText()),
                   const SizedBox(height: 24),
                   const _ConnectionStatus(),
@@ -1142,15 +1252,16 @@ class _TopStatusBar extends StatelessWidget {
             onPressed: onLoginTap,
           ),
         if (showLoginAction) const SizedBox(width: 8),
-        IconButton(
-          icon: const Icon(
-            Icons.admin_panel_settings,
-            color: Colors.tealAccent,
-            size: 20,
+        if (showLoginAction)
+          IconButton(
+            icon: const Icon(
+              Icons.admin_panel_settings,
+              color: Colors.tealAccent,
+              size: 20,
+            ),
+            onPressed: onAdminTap,
           ),
-          onPressed: onAdminTap,
-        ),
-        const SizedBox(width: 8),
+        if (showLoginAction) const SizedBox(width: 8),
       ],
     );
   }

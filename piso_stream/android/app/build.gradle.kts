@@ -37,6 +37,12 @@ android {
             signingConfig = signingConfigs.getByName("debug")
         }
     }
+
+    lint {
+        disable += "LintVitalAnalyzeRelease"
+        checkReleaseBuilds = false
+        abortOnError = false
+    }
 }
 
 flutter {

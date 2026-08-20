@@ -21,12 +21,14 @@ class StandaloneSalesSummary {
     required this.daily,
     required this.weekly,
     required this.monthly,
+    required this.averageDaily,
   });
 
   final int total;
   final int daily;
   final int weekly;
   final int monthly;
+  final double averageDaily;
 }
 
 class StandaloneCoinSaleLog {
@@ -202,7 +204,9 @@ class LocalDbService {
     final db = await database;
     final now = DateTime.now();
     final startOfDay = DateTime(now.year, now.month, now.day);
-    final startOfWeek = startOfDay.subtract(Duration(days: startOfDay.weekday - 1));
+    final startOfWeek = startOfDay.subtract(
+      Duration(days: startOfDay.weekday - 1),
+    );
     final startOfMonth = DateTime(now.year, now.month);
 
     Future<int> sumFrom(int? fromMillis) async {
@@ -215,20 +219,38 @@ class LocalDbService {
       return (result.first['total'] as num?)?.toInt() ?? 0;
     }
 
+    final total = await sumFrom(null);
+    final activeDayRows = await db.rawQuery('''
+      SELECT COUNT(
+        DISTINCT strftime(
+          '%Y-%m-%d',
+          created_at / 1000,
+          'unixepoch',
+          'localtime'
+        )
+      ) AS day_count
+      FROM standalone_sales
+    ''');
+    final activeDays = (activeDayRows.first['day_count'] as num?)?.toInt() ?? 0;
+
     return StandaloneSalesSummary(
-      total: await sumFrom(null),
+      total: total,
       daily: await sumFrom(startOfDay.millisecondsSinceEpoch),
       weekly: await sumFrom(startOfWeek.millisecondsSinceEpoch),
       monthly: await sumFrom(startOfMonth.millisecondsSinceEpoch),
+      averageDaily: activeDays <= 0 ? 0 : total / activeDays,
     );
   }
 
   Future<List<StandaloneCoinSaleLog>> getStandaloneSaleLogs({
     int limit = 300,
+    int? fromMillis,
   }) async {
     final db = await database;
     final rows = await db.query(
       'standalone_sales',
+      where: fromMillis == null ? null : 'created_at >= ?',
+      whereArgs: fromMillis == null ? null : <Object>[fromMillis],
       orderBy: 'created_at DESC',
       limit: limit,
     );
