@@ -7,6 +7,7 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../app_settings.dart';
+import 'controller_endpoint.dart';
 
 class MqttCoinEvent {
   const MqttCoinEvent({
@@ -47,7 +48,6 @@ class StandaloneMqttService {
 
   static final StandaloneMqttService instance = StandaloneMqttService._();
 
-  static const int _controllerPort = 81;
   static const int _httpControllerPort = 80;
   static const Duration _controllerTimeout = Duration(seconds: 10);
   static const Duration _httpTimeout = _controllerTimeout;
@@ -67,6 +67,8 @@ class StandaloneMqttService {
   WebSocket? _socket;
   String? _connectedHost;
   String? _resolvedHost;
+  int? _connectedPort;
+  ControllerTransport? _connectedTransport;
   Map<String, dynamic>? _latestControllerStatus;
   Future<bool>? _connectionFuture;
   String? _connectionFutureHost;
@@ -80,35 +82,55 @@ class StandaloneMqttService {
       _socket?.readyState == WebSocket.open || _httpConnected;
   String? get connectedHost => _connectedHost;
   String? get resolvedHost => _resolvedHost;
+  int? get connectedPort => _connectedPort;
+  ControllerTransport? get connectedTransport => _connectedTransport;
   Map<String, dynamic>? get latestControllerStatus => _latestControllerStatus;
 
   Future<bool> connectBySavedHost() async {
-    final prefs = await SharedPreferences.getInstance();
-    final host = prefs.getString(AppSettings.standaloneControllerIpKey)?.trim();
-    if (host == null || host.isEmpty) {
+    final config = await ControllerEndpointConfig.load();
+    final endpoint = config.activeEndpoint;
+    if (endpoint.host.trim().isEmpty) {
       _messageController.add(<String, dynamic>{
         'type': 'error',
         'message': 'No saved coin controller address.',
       });
       return false;
     }
-    return connectByHost(host);
+    return connectByEndpoint(endpoint);
   }
 
   Future<bool> connectByHost(String host) async {
-    final mode = await _loadCommunicationMode();
+    final config = await ControllerEndpointConfig.load();
+    final endpoint = config.activeEndpoint;
 
-    if (mode == ControllerCommunicationMode.http) {
-      return _connectHttpByHost(host);
-    }
-
-    return _connectSocketByHost(host);
+    return connectByEndpoint(
+      ControllerEndpoint(
+        transport: endpoint.transport,
+        host: host,
+        port: endpoint.port,
+      ),
+    );
   }
 
-  Future<bool> _connectSocketByHost(String host) async {
+  Future<bool> connectByEndpoint(ControllerEndpoint endpoint) async {
+    print(
+      '[CONTROLLER] Mode=${endpoint.label} Host=${endpoint.host} Port=${endpoint.port}',
+    );
+
+    if (endpoint.transport == ControllerTransport.http) {
+      return _connectHttpByHost(endpoint.host, port: endpoint.port);
+    }
+
+    return _connectSocketByHost(endpoint.host, port: endpoint.port);
+  }
+
+  Future<bool> _connectSocketByHost(
+    String host, {
+    required int port,
+  }) async {
     _httpConnected = false;
     _stopHttpEventPolling();
-    print('[CoinWS] connect requested host=$host');
+    print('[CoinWS] connect requested host=$host port=$port');
     final normalizedHost = _normalizeControllerHost(host);
     print('[CoinWS] normalized host=$normalizedHost');
     if (normalizedHost.isEmpty) {
@@ -120,14 +142,16 @@ class StandaloneMqttService {
     }
 
     if (_socket?.readyState == WebSocket.open &&
-        _connectedHost == normalizedHost) {
-      print('[CoinWS] reusing existing connection host=$normalizedHost');
+        _connectedHost == normalizedHost &&
+        _connectedPort == port &&
+        _connectedTransport == ControllerTransport.socket) {
+      print('[CoinWS] reusing existing connection host=$normalizedHost port=$port');
       return true;
     }
 
     final activeConnectionFuture = _connectionFuture;
     if (activeConnectionFuture != null) {
-      if (_connectionFutureHost == normalizedHost) {
+      if (_connectionFutureHost == '$normalizedHost:$port') {
         print(
           '[CoinWS] reusing existing connection attempt host=$normalizedHost',
         );
@@ -140,15 +164,19 @@ class StandaloneMqttService {
     }
 
     if (_socket?.readyState == WebSocket.open &&
-        _connectedHost != normalizedHost) {
-      print('[CoinWS] closing old socket for host=$_connectedHost');
+        (_connectedHost != normalizedHost || _connectedPort != port)) {
+      print('[CoinWS] closing old socket for host=$_connectedHost port=$_connectedPort');
       await disconnect();
     }
 
     final generation = ++_connectionGeneration;
-    final connectionFuture = _connectByHostLocked(normalizedHost, generation);
+    final connectionFuture = _connectByHostLocked(
+      normalizedHost,
+      generation,
+      port: port,
+    );
     _connectionFuture = connectionFuture;
-    _connectionFutureHost = normalizedHost;
+    _connectionFutureHost = '$normalizedHost:$port';
 
     try {
       return await connectionFuture;
@@ -319,6 +347,8 @@ class StandaloneMqttService {
     _socket = null;
     _connectedHost = null;
     _resolvedHost = null;
+    _connectedPort = null;
+    _connectedTransport = null;
     _latestControllerStatus = null;
     _httpConnected = false;
     _stopHttpEventPolling();
@@ -375,6 +405,8 @@ class StandaloneMqttService {
       _socket = null;
       _connectedHost = null;
       _resolvedHost = null;
+      _connectedPort = null;
+      _connectedTransport = null;
       throw StateError('Coin controller is not connected.');
     }
     socket.add(jsonEncode(payload));
@@ -425,6 +457,8 @@ class StandaloneMqttService {
     _socket = null;
     _connectedHost = null;
     _resolvedHost = null;
+    _connectedPort = null;
+    _connectedTransport = null;
     _latestControllerStatus = null;
     _messageController.add(<String, dynamic>{
       'type': 'disconnected',
@@ -446,8 +480,11 @@ class StandaloneMqttService {
     return await _loadCommunicationMode() == ControllerCommunicationMode.http;
   }
 
-  Future<bool> _connectHttpByHost(String host) async {
-    print('[CoinHTTP] connect requested host=$host');
+  Future<bool> _connectHttpByHost(
+    String host, {
+    required int port,
+  }) async {
+    print('[CoinHTTP] connect requested host=$host port=$port');
     final normalizedHost = _normalizeControllerHost(host);
     if (normalizedHost.isEmpty) {
       _messageController.add(<String, dynamic>{
@@ -469,7 +506,7 @@ class StandaloneMqttService {
       );
 
       final response = await http
-          .get(_httpUri(connectionHost, '/api/status'))
+          .get(_httpUri(connectionHost, '/api/status', port: port))
           .timeout(_httpTimeout);
 
       final decoded = _decodeHttpResponse(response);
@@ -478,6 +515,8 @@ class StandaloneMqttService {
         _httpConnected = false;
         _connectedHost = null;
         _resolvedHost = null;
+        _connectedPort = null;
+        _connectedTransport = null;
         _messageController.add(<String, dynamic>{
           'type': 'error',
           'message': _httpErrorMessage(response.statusCode, decoded),
@@ -489,6 +528,8 @@ class StandaloneMqttService {
       _httpConnected = true;
       _connectedHost = normalizedHost;
       _resolvedHost = connectionHost;
+      _connectedPort = port;
+      _connectedTransport = ControllerTransport.http;
       _latestControllerStatus = decoded;
       _messageController.add(<String, dynamic>{
         ...decoded,
@@ -502,6 +543,8 @@ class StandaloneMqttService {
       _httpConnected = false;
       _connectedHost = null;
       _resolvedHost = null;
+      _connectedPort = null;
+      _connectedTransport = null;
       _latestControllerStatus = null;
       _messageController.add(<String, dynamic>{
         'type': 'error',
@@ -664,9 +707,14 @@ class StandaloneMqttService {
     try {
       final response = await http
           .get(
-            _httpUri(host, '/api/events', <String, String>{
-              'launcher_device_id': launcherDeviceId,
-            }),
+            _httpUri(
+              host,
+              '/api/events',
+              port: _connectedPort,
+              queryParameters: <String, String>{
+                'launcher_device_id': launcherDeviceId,
+              },
+            ),
           )
           .timeout(_httpTimeout);
       final data = _decodeHttpResponse(response);
@@ -724,7 +772,7 @@ class StandaloneMqttService {
     try {
       final response = await http
           .post(
-            _httpUri(host, path),
+            _httpUri(host, path, port: _connectedPort),
             headers: const <String, String>{
               HttpHeaders.contentTypeHeader: 'application/json',
             },
@@ -763,13 +811,14 @@ class StandaloneMqttService {
 
   Uri _httpUri(
     String host,
-    String path, [
+    String path, {
+    int? port,
     Map<String, String>? queryParameters,
-  ]) {
+  }) {
     return Uri(
       scheme: 'http',
       host: host,
-      port: _httpControllerPort,
+      port: port ?? _connectedPort ?? _httpControllerPort,
       path: path,
       queryParameters: queryParameters,
     );
@@ -805,6 +854,12 @@ class StandaloneMqttService {
   Future<void> _closeSocketOnly() async {
     final socket = _socket;
     _socket = null;
+    if (_connectedTransport == ControllerTransport.socket) {
+      _connectedHost = null;
+      _resolvedHost = null;
+      _connectedPort = null;
+      _connectedTransport = null;
+    }
     if (socket != null) {
       try {
         await socket.close().timeout(const Duration(seconds: 2));
@@ -814,8 +869,9 @@ class StandaloneMqttService {
 
   Future<bool> _connectByHostLocked(
     String normalizedHost,
-    int generation,
-  ) async {
+    int generation, {
+    required int port,
+  }) async {
     try {
       final connectionHost = await _resolveConnectionHost(normalizedHost);
       if (generation != _connectionGeneration) {
@@ -823,7 +879,7 @@ class StandaloneMqttService {
         return false;
       }
 
-      final url = 'ws://$connectionHost:$_controllerPort';
+      final url = 'ws://$connectionHost:$port';
       print('[CoinWS] connecting $url');
       final socket = await WebSocket.connect(url).timeout(_controllerTimeout);
 
@@ -838,6 +894,8 @@ class StandaloneMqttService {
       _socket = socket;
       _connectedHost = normalizedHost;
       _resolvedHost = connectionHost;
+      _connectedPort = port;
+      _connectedTransport = ControllerTransport.socket;
       _latestControllerStatus = null;
 
       socket.listen(
@@ -861,6 +919,8 @@ class StandaloneMqttService {
         _socket = null;
         _connectedHost = null;
         _resolvedHost = null;
+        _connectedPort = null;
+        _connectedTransport = null;
         _latestControllerStatus = null;
         print('[CoinWS] connection failed host=$normalizedHost error=$error');
         _messageController.add(<String, dynamic>{

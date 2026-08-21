@@ -5,6 +5,10 @@ class AppSettings {
   static const String standaloneControllerIpKey = 'standalone_controller_ip';
   static const String controllerCommunicationModeKey =
       'controller_communication_mode';
+  static const String controllerSocketHostKey = 'controller_socket_host';
+  static const String controllerSocketPortKey = 'controller_socket_port';
+  static const String controllerHttpHostKey = 'controller_http_host';
+  static const String controllerHttpPortKey = 'controller_http_port';
   static const String businessNameKey = 'business_name';
   static const String deviceNameKey = 'device_name';
   static const String portraitWallpaperKey = 'portrait_wallpaper_path';
@@ -58,6 +62,8 @@ class AppSettings {
   static const String nativeCloseDebugKey = 'native_close_debug';
   static const String defaultGracePeriodLabel = '1 minute';
   static const String defaultStandaloneControllerIp = '192.168.1.3';
+  static const int defaultControllerSocketPort = 81;
+  static const int defaultControllerHttpPort = 80;
   static const String defaultChargerBleNamePrefix = 'PisoCharger';
   static const String defaultShellyOnUrl =
       'http://192.168.1.4/relay/0?turn=on';

@@ -13,9 +13,11 @@ import 'standalone_sales_page.dart';
 import 'services/admin_pin_service.dart';
 import 'services/audio_service.dart';
 import 'services/ble_charger_service.dart';
+import 'services/controller_endpoint.dart';
 import 'services/device_identity_service.dart';
 import 'services/local_db_service.dart';
 import 'services/shelly_charger_service.dart';
+import 'services/service_manager.dart';
 import 'services/socket_service.dart';
 import 'services/standalone_mqtt_service.dart';
 import 'services/update_service.dart';
@@ -66,6 +68,18 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
   final TextEditingController _standaloneControllerIpController =
       TextEditingController(
         text: AppSettings.defaultStandaloneControllerIp,
+      );
+  final TextEditingController _controllerSocketHostController =
+      TextEditingController(text: AppSettings.defaultStandaloneControllerIp);
+  final TextEditingController _controllerSocketPortController =
+      TextEditingController(
+        text: AppSettings.defaultControllerSocketPort.toString(),
+      );
+  final TextEditingController _controllerHttpHostController =
+      TextEditingController(text: AppSettings.defaultStandaloneControllerIp);
+  final TextEditingController _controllerHttpPortController =
+      TextEditingController(
+        text: AppSettings.defaultControllerHttpPort.toString(),
       );
   final TextEditingController _onePesoMinutesController =
       TextEditingController(
@@ -215,6 +229,27 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
       _standaloneControllerIpController.text =
           prefs.getString(AppSettings.standaloneControllerIpKey) ??
           AppSettings.defaultStandaloneControllerIp;
+      final legacyControllerHost = _standaloneControllerIpController.text.trim();
+      final savedSocketHost =
+          prefs.getString(AppSettings.controllerSocketHostKey)?.trim();
+      final savedHttpHost =
+          prefs.getString(AppSettings.controllerHttpHostKey)?.trim();
+      _controllerSocketHostController.text =
+          savedSocketHost?.isNotEmpty == true
+              ? savedSocketHost!
+              : legacyControllerHost;
+      _controllerSocketPortController.text =
+          (prefs.getInt(AppSettings.controllerSocketPortKey) ??
+                  AppSettings.defaultControllerSocketPort)
+              .toString();
+      _controllerHttpHostController.text =
+          savedHttpHost?.isNotEmpty == true
+              ? savedHttpHost!
+              : legacyControllerHost;
+      _controllerHttpPortController.text =
+          (prefs.getInt(AppSettings.controllerHttpPortKey) ??
+                  AppSettings.defaultControllerHttpPort)
+              .toString();
       _controllerCommunicationMode =
           prefs.getString(AppSettings.controllerCommunicationModeKey) ??
           AppSettings.controllerCommunicationModeSocket;
@@ -661,12 +696,30 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
     if (_isStandaloneMode) {
       SocketService.disconnectShared();
     }
+    final socketHost = _controllerSocketHostController.text.trim().isEmpty
+        ? AppSettings.defaultStandaloneControllerIp
+        : _controllerSocketHostController.text.trim();
+    final httpHost = _controllerHttpHostController.text.trim().isEmpty
+        ? AppSettings.defaultStandaloneControllerIp
+        : _controllerHttpHostController.text.trim();
+    final socketPort =
+        int.tryParse(_controllerSocketPortController.text.trim()) ??
+        AppSettings.defaultControllerSocketPort;
+    final httpPort =
+        int.tryParse(_controllerHttpPortController.text.trim()) ??
+        AppSettings.defaultControllerHttpPort;
+    final activeControllerHost =
+        _controllerCommunicationMode == AppSettings.controllerCommunicationModeHttp
+        ? httpHost
+        : socketHost;
     await prefs.setString(
       AppSettings.standaloneControllerIpKey,
-      _standaloneControllerIpController.text.trim().isEmpty
-          ? AppSettings.defaultStandaloneControllerIp
-          : _standaloneControllerIpController.text.trim(),
+      activeControllerHost,
     );
+    await prefs.setString(AppSettings.controllerSocketHostKey, socketHost);
+    await prefs.setInt(AppSettings.controllerSocketPortKey, socketPort);
+    await prefs.setString(AppSettings.controllerHttpHostKey, httpHost);
+    await prefs.setInt(AppSettings.controllerHttpPortKey, httpPort);
     await prefs.setString(
       AppSettings.controllerCommunicationModeKey,
       _controllerCommunicationMode,
@@ -868,6 +921,8 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
       debugPrint('[ChargingMonitor][settings-save] failed: ${error.message}');
     }
 
+    await PisoStreamServiceManager.instance.applySettings();
+
     final shouldRestartForBackgroundServices =
         previousBackgroundServicesEnabled != _backgroundServicesEnabled;
     final saveMessage = shouldRestartForBackgroundServices
@@ -1017,30 +1072,51 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
     });
 
     try {
-      final connected = await StandaloneMqttService.instance.connectByHost(
-        _standaloneControllerIpController.text.trim(),
+      final isHttpMode =
+          _controllerCommunicationMode == AppSettings.controllerCommunicationModeHttp;
+      final host = isHttpMode
+          ? _controllerHttpHostController.text.trim()
+          : _controllerSocketHostController.text.trim();
+      final port = int.tryParse(
+            isHttpMode
+                ? _controllerHttpPortController.text.trim()
+                : _controllerSocketPortController.text.trim(),
+          ) ??
+          (isHttpMode
+              ? AppSettings.defaultControllerHttpPort
+              : AppSettings.defaultControllerSocketPort);
+      final endpoint = ControllerEndpoint(
+        transport: isHttpMode
+            ? ControllerTransport.http
+            : ControllerTransport.socket,
+        host: host,
+        port: port,
+      );
+      final connected = await StandaloneMqttService.instance.connectByEndpoint(
+        endpoint,
       );
       if (!mounted) {
         return;
       }
-      final savedAddress =
-          StandaloneMqttService.instance.connectedHost ??
-          _standaloneControllerIpController.text.trim();
+      final savedAddress = StandaloneMqttService.instance.connectedHost ?? host;
       final resolvedAddress = StandaloneMqttService.instance.resolvedHost;
+      final connectedPort = StandaloneMqttService.instance.connectedPort ?? port;
       setState(() {
         _coinControllerStatus = connected
             ? resolvedAddress == null || resolvedAddress == savedAddress
-                  ? 'Connected to coin controller at $savedAddress'
+                  ? 'Connected via ${endpoint.label} at $savedAddress:$connectedPort'
                   : 'Connected to coin controller at '
-                        '$savedAddress ($resolvedAddress)'
-            : 'Unable to connect to the coin controller';
+                        '$savedAddress ($resolvedAddress):$connectedPort'
+            : 'Unable to reach the coin controller. '
+                'Mode: ${endpoint.label}, Host: ${endpoint.host}, Port: ${endpoint.port}';
       });
     } catch (error) {
       if (!mounted) {
         return;
       }
       setState(() {
-        _coinControllerStatus = 'Connection failed: $error';
+        _coinControllerStatus =
+            'Unable to reach the coin controller. Technical error: $error';
       });
     } finally {
       if (!mounted) {
@@ -1819,6 +1895,10 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
     _shellyUsernameController.dispose();
     _shellyPasswordController.dispose();
     _standaloneControllerIpController.dispose();
+    _controllerSocketHostController.dispose();
+    _controllerSocketPortController.dispose();
+    _controllerHttpHostController.dispose();
+    _controllerHttpPortController.dispose();
     _onePesoMinutesController.dispose();
     _fivePesoMinutesController.dispose();
     _tenPesoMinutesController.dispose();
@@ -2018,15 +2098,100 @@ class _SettingsPageState extends State<SettingsPage> with WidgetsBindingObserver
                           ),
                           Padding(
                             padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
-                            child: TextFormField(
-                              controller: _standaloneControllerIpController,
-                              style: const TextStyle(color: Colors.white),
-                              decoration: const InputDecoration(
-                                labelText: 'ESP32 Address',
-                                labelStyle: TextStyle(color: Colors.white70),
-                                helperText:
-                                    'Socket: 192.168.1.100. HTTP: pisocoin-A99B20.local or IP',
-                                helperStyle: TextStyle(color: Colors.white54),
+                            child: Column(
+                              children: [
+                                Row(
+                                  children: [
+                                    Expanded(
+                                      flex: 3,
+                                      child: TextFormField(
+                                        controller: _controllerSocketHostController,
+                                        enabled:
+                                            _controllerCommunicationMode ==
+                                            AppSettings
+                                                .controllerCommunicationModeSocket,
+                                        style: const TextStyle(color: Colors.white),
+                                        decoration: const InputDecoration(
+                                          labelText: 'Socket Host',
+                                          labelStyle:
+                                              TextStyle(color: Colors.white70),
+                                          helperText: 'Example: 192.168.1.100',
+                                          helperStyle:
+                                              TextStyle(color: Colors.white54),
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 12),
+                                    Expanded(
+                                      child: TextFormField(
+                                        controller: _controllerSocketPortController,
+                                        enabled:
+                                            _controllerCommunicationMode ==
+                                            AppSettings
+                                                .controllerCommunicationModeSocket,
+                                        keyboardType: TextInputType.number,
+                                        style: const TextStyle(color: Colors.white),
+                                        decoration: const InputDecoration(
+                                          labelText: 'Port',
+                                          labelStyle:
+                                              TextStyle(color: Colors.white70),
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                                const SizedBox(height: 12),
+                                Row(
+                                  children: [
+                                    Expanded(
+                                      flex: 3,
+                                      child: TextFormField(
+                                        controller: _controllerHttpHostController,
+                                        enabled:
+                                            _controllerCommunicationMode ==
+                                            AppSettings
+                                                .controllerCommunicationModeHttp,
+                                        style: const TextStyle(color: Colors.white),
+                                        decoration: const InputDecoration(
+                                          labelText: 'HTTP Host',
+                                          labelStyle:
+                                              TextStyle(color: Colors.white70),
+                                          helperText:
+                                              'Example: pisocoin-A99B20.local or IP',
+                                          helperStyle:
+                                              TextStyle(color: Colors.white54),
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 12),
+                                    Expanded(
+                                      child: TextFormField(
+                                        controller: _controllerHttpPortController,
+                                        enabled:
+                                            _controllerCommunicationMode ==
+                                            AppSettings
+                                                .controllerCommunicationModeHttp,
+                                        keyboardType: TextInputType.number,
+                                        style: const TextStyle(color: Colors.white),
+                                        decoration: const InputDecoration(
+                                          labelText: 'Port',
+                                          labelStyle:
+                                              TextStyle(color: Colors.white70),
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ],
+                            ),
+                          ),
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                            child: Text(
+                              'The selected mode uses only its matching host and port.',
+                              style: const TextStyle(
+                                color: Colors.white54,
+                                fontSize: 12,
                               ),
                             ),
                           ),

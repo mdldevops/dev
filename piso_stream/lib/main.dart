@@ -16,6 +16,7 @@ import 'services/customer_account_service.dart';
 import 'services/device_identity_service.dart';
 import 'services/ble_charger_service.dart';
 import 'services/shelly_charger_service.dart';
+import 'services/service_manager.dart';
 import 'services/standalone_mqtt_service.dart';
 import 'services/socket_service.dart';
 import 'services/api_service.dart';
@@ -54,10 +55,12 @@ class _MyAppState extends State<MyApp> {
   @override
   void dispose() {
     _sharedSocket?.removeBroadcastListener(_showBroadcastPopup);
+    unawaited(PisoStreamServiceManager.instance.stop());
     super.dispose();
   }
 
   Future<void> _initializeServices() async {
+    await PisoStreamServiceManager.instance.start();
     final prefs = await SharedPreferences.getInstance();
     final setupMode = prefs.getString(AppSettings.setupModeKey);
     if (AppSettings.isStandaloneModeValue(setupMode)) {
